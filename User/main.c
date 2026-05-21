@@ -1,8 +1,15 @@
 /*
  * 文件：User/main.c
- * 版本：Bluetooth + 8路灰度循迹精简调参版
+ * 版本：Bluetooth + 8路灰度循迹精简调参版 + main.c 灰度直读排查版 + AD1改PB3/AD2改PB4版
  *
- * 本文件只负责应用层逻辑，不修改 Hardware 文件夹中的驱动代码。
+ *
+ * 本版新增：
+ *   1. 在 main.c 内部强制重新初始化八路灰度 GPIO：AD0=PA8、AD1=PB3、AD2=PB4、OUT=PB0。
+ *   2. 在 main.c 内部直接切换 AD0/AD1/AD2 并读取 OUT，绕过 Grayscale_ReadAll()。
+ *   3. OLED 最后一行显示 R/M/E：
+ *        R = 原始直读掩码，不受 lineReverse 影响，用于排查 AD1 是否生效；
+ *        M = 实际参与循迹计算的掩码；
+ *        E = 缩小后的循迹误差。
  *
  * 功能总览：
  *   1. 上电默认进入蓝牙遥控模式。
@@ -12,12 +19,8 @@
  *   5. 只有收到 [key,unlock,down] 后才解除锁定，避免误触后小车继续运动。
  *   6. 网页滑杆 [slider,RP,0~100] 用作最大 PWM 百分比限幅。
  *   7. 支持网页滑杆在线调 PID、循迹、速度、滤波、斜坡等重要参数。
- *   8. 周期回传 [p,...] 绘图包，便于在网页绘图区观察控制状态。
- *
- * 注意：
- *   - 本文件不依赖 BT_proto.c 的解析函数，主循环中直接从 Serial_ReadByte() 取串口数据并解析。
- *   - 这样做是为了满足“只修改 main.c，不修改 Hardware 文件夹”的要求。
- *   - Hardware/BT_proto.c 可以继续保留在工程里，但本 main.c 不调用 BT_Process()。
+ *   8. SW1/K1：把 RP 设置为 0%，PWM 立即清零，但不进入急停锁定。
+ *   9. SW2/K2：在蓝牙遥控模式和循迹模式之间切换；急停锁定时无效。
  */
 
 #include "stm32f10x.h"
@@ -39,75 +42,40 @@
  * 1. 基础控制周期和安全参数
  * ================================================================ */
 
-/* 速度 PID、循迹控制统一每 10 ms 运行一次。 */
 #define CONTROL_PERIOD_MS              10U
-
-/* 蓝牙遥控超时时间。超过该时间未收到新运动包，蓝牙模式自动停车。 */
 #define BT_TIMEOUT_MS                  600U
-
-/* 网页 [p,...] 绘图包回传周期。100 ms 一次既比较实时，也不会占满串口带宽。 */
 #define PLOT_REPORT_PERIOD_MS          100U
-
-/* OLED 本地状态刷新周期。OLED 是软件 I2C，全屏刷新太频繁会影响主循环。 */
 #define OLED_REFRESH_PERIOD_MS         100U
 
-/* 蓝牙 RP 滑杆对应最大 PWM 限幅。PWM_MAX_DUTY 在 Hardware/PWM.h 中定义，通常为 1000。 */
 #define PWM_LIMIT_MIN                  0.0f
 #define PWM_LIMIT_MAX                  ((float)PWM_MAX_DUTY)
 
 /* ================================================================
  * 2. 八路灰度循迹默认参数
- *
- * 这些参数都可以通过网页 [slider,参数名,数值] 在线修改。
- * 具体参数名见本文档下方 Main_ApplySliderPacket() 和配套 MD 文档。
  * ================================================================ */
 
-/* 大部分数字量灰度模块检测黑线输出 1；如果你的模块黑线输出 0，可网页发送 [slider,blackLevel,0]。 */
 volatile float g_lineBlackLevelF = 1.0f;
-
-/* 若灰度板左右顺序和小车实际安装方向相反，可改为 1。也可以用 [slider,lineReverse,1] 在线设置。 */
 volatile float g_lineReverseOrderF = 0.0f;
-
-/* 循迹转向符号。若黑线在右侧时小车反而向左修，发送 [slider,lineSign,-1]。 */
 volatile float g_lineTurnSign = 1.0f;
 
-/* 纯循迹基础速度，单位是“编码器脉冲/10ms”的目标速度。实际还会乘 g_speedScale。 */
 volatile float g_traceBaseSpeed = 24.0f;
-
-/* 丢线找线速度。 */
 volatile float g_traceSearchSpeed = 8.0f;
 
-/* 循迹 P/D 参数。P 决定基本转向，D 用于进弯时提前给方向。 */
 volatile float g_lineKp = 0.135f;
 volatile float g_lineKd = 0.055f;
-
-/* 循迹转向限幅，防止差速目标过大。弯道转不过时可适当增大。 */
 volatile float g_lineTurnLimit = 90.0f;
-
-/* 丢线后按最后一次方向找线的转向力度。 */
 volatile float g_lineLostTurn = 72.0f;
-
-/* 灰度误差一阶低通滤波系数，0~1。越大反应越快，越小越平滑。 */
 volatile float g_lineFilterAlpha = 0.65f;
-
-/* 偏差越大自动降速。0.55 表示大偏差时最多降低约 55% 基础速度。 */
 volatile float g_lineSlowGain = 0.55f;
-
-/* 最外侧探头看到黑线时，认为进入急弯或偏差较大，额外加转向并降速。 */
 volatile float g_lineEdgeTurnExtra = 22.0f;
 volatile float g_lineEdgeSpeedRatio = 0.55f;
-
-/* 中等偏差以上的最小转向，避免转向量太小导致小车直冲弯道。 */
 volatile float g_lineMinTurn = 18.0f;
 
-/* 目标速度斜坡限制。每 10ms 目标最多变化多少，用于减少电机突变。 */
 volatile float g_forwardSlewStep = 3.0f;
 volatile float g_turnSlewStep = 14.0f;
 
 /* ================================================================
  * 3. 速度环/差速环 PID 参数
- *
- * ForwardPID 控制平均速度；TurnPID 控制左右轮速度差。
  * ================================================================ */
 
 typedef struct
@@ -124,17 +92,14 @@ typedef struct
 static PID_TypeDef ForwardPID;
 static PID_TypeDef TurnPID;
 
-/* 速度环 PID，网页参数名：speedKp / speedKi / speedKd。 */
 volatile float g_forwardKp = 14.0f;
 volatile float g_forwardKi = 0.55f;
 volatile float g_forwardKd = 1.8f;
 
-/* 差速环 PID，网页参数名：turnKp 或 diffKp，turnKi/diffKi，turnKd/diffKd。 */
 volatile float g_turnKp = 10.0f;
 volatile float g_turnKi = 0.04f;
 volatile float g_turnKd = 1.0f;
 
-/* 蓝牙遥控最大目标速度/转向目标。实际会乘 g_speedScale。 */
 volatile float g_maxForwardCmd = 70.0f;
 volatile float g_maxTurnCmd = 75.0f;
 
@@ -144,59 +109,46 @@ volatile float g_maxTurnCmd = 75.0f;
 
 typedef enum
 {
-    WORK_BT = 0,       /* 蓝牙遥控模式 */
-    WORK_TRACING = 1   /* 八路灰度循迹模式 */
+    WORK_BT = 0,
+    WORK_TRACING = 1
 } WorkMode_t;
 
 volatile WorkMode_t g_workMode = WORK_BT;
 
-/* 上层控制输出的目标速度。单位是编码器脉冲/10ms。 */
 volatile float g_targetForwardSpeed = 0.0f;
 volatile float g_targetTurnSpeed = 0.0f;
 
-/* 控制使能：1 允许 PID 输出电机，0 停车。 */
 volatile uint8_t g_carEnable = 0;
-
-/* 距离上一次收到蓝牙有效数据包的时间，单位 ms。 */
 volatile uint32_t g_lastCmdTickMs = 1000;
-
-/* 急停安全锁：1 表示锁定，此时任何运动命令都无效。 */
 volatile uint8_t g_safetyLocked = 0;
 
-/* 蓝牙 RP 滑杆值和换算出的限速。 */
 volatile float g_btSpeedLimitPercent = 30.0f;
 volatile float g_speedScale = 0.30f;
 volatile float g_pwmLimit = 300.0f;
 
-/* 编码器测得的实时速度。 */
 volatile float g_leftSpeed = 0.0f;
 volatile float g_rightSpeed = 0.0f;
 volatile float g_forwardSpeed = 0.0f;
 volatile float g_turnSpeed = 0.0f;
 
-/* PID 输出。g_speedPwm 为前进速度环输出，g_diffPwm 为差速环输出。 */
 volatile float g_speedPwm = 0.0f;
 volatile float g_diffPwm = 0.0f;
 
-/* 左右轮最终 PWM。 */
 volatile int16_t g_leftPwm = 0;
 volatile int16_t g_rightPwm = 0;
-
-/* 用于网页绘图的前进速度误差。 */
 volatile float g_forwardSpeedError = 0.0f;
 
-/* 这些变量保留给旧版 BT_proto.c 链接使用。本 main.c 不调用 BT_Process()，但工程中若仍编译 BT_proto.c，需要这些符号存在。 */
+/* 保留给旧版 BT_proto.c 链接使用。 */
 volatile uint8_t g_sendPlot = 0;
 volatile uint16_t g_sendDisplay = 0;
 
-/* OLED 和 plot 的节拍标志。 */
 volatile uint16_t g_oledRefreshMs = 0;
 volatile uint16_t g_plotReportMs = 0;
 
-/* 灰度循迹状态。 */
 volatile int16_t g_lineError = 0;
 volatile uint8_t g_lineValid = 0;
 volatile uint8_t g_lineMask = 0;
+volatile uint8_t g_lineRawMask = 0;
 volatile int8_t g_lastLineDir = 1;
 volatile uint16_t g_lineLostMs = 0;
 
@@ -325,7 +277,6 @@ static float PID_Calc(PID_TypeDef *pid, float target, float measure)
 
     output = pid->Kp * error + pid->Ki * integralCandidate + pid->Kd * derivative;
 
-    /* 简单抗积分饱和：输出顶到限幅时，只允许积分向脱离饱和方向变化。 */
     if (output > pid->OutputLimit)
     {
         output = pid->OutputLimit;
@@ -419,9 +370,6 @@ static void Prompt_Tick1ms(void)
 
 /* ================================================================
  * 7. 模式切换和急停接口
- *
- * 这些函数名保留，是为了兼容工程中已有的 BT_proto.c。
- * 本 main.c 内置解析器也会调用这些函数。
  * ================================================================ */
 
 void App_EmergencyStop(void)
@@ -493,14 +441,12 @@ static void ApplySpeedLimitPercent(float percent)
 
 static void Main_ApplySliderPacket(const char *name, float value)
 {
-    /* 最高 PWM 限幅：0~100，对应 0%~100%。 */
     if (str_is_name(name, "RP", "rp", "speedLimit"))
     {
         ApplySpeedLimitPercent(value);
         return;
     }
 
-    /* 速度环 PID。示例：[slider,speedKp,10] -> Kp=10。 */
     if (str_is_name(name, "speedKp", "forwardKp", "fKp"))
     {
         g_forwardKp = limit_float(value, 0.0f, 80.0f);
@@ -517,7 +463,6 @@ static void Main_ApplySliderPacket(const char *name, float value)
         return;
     }
 
-    /* 差速/转向环 PID。diffKp 和 turnKp 等价。 */
     if (str_is_name(name, "turnKp", "diffKp", "tKp"))
     {
         g_turnKp = limit_float(value, 0.0f, 80.0f);
@@ -534,7 +479,6 @@ static void Main_ApplySliderPacket(const char *name, float value)
         return;
     }
 
-    /* 蓝牙手动模式最大目标速度/转向速度。 */
     if (str_is_name(name, "maxForward", "maxSpeed", "btSpeed"))
     {
         g_maxForwardCmd = limit_float(value, 0.0f, 200.0f);
@@ -546,7 +490,6 @@ static void Main_ApplySliderPacket(const char *name, float value)
         return;
     }
 
-    /* 循迹参数。 */
     if (str_is_name(name, "traceKp", "lineKp", "lineP"))
     {
         g_lineKp = limit_float(value, 0.0f, 1.0f);
@@ -579,7 +522,6 @@ static void Main_ApplySliderPacket(const char *name, float value)
     }
     if (str_is_name(name, "filter", "lineFilter", "alpha"))
     {
-        /* 支持 0~1，也支持 0~100 两种输入。 */
         if (value > 1.0f)
         {
             value = value / 100.0f;
@@ -658,12 +600,6 @@ static void Main_ApplyJoystickPacket(char **tok, int n)
         return;
     }
 
-    /*
-     * 用户指定协议：
-     *   [joystick,左右转向控制数据,前后速度控制数据,忽略,忽略]
-     *
-     * 因此：tok[1] 用作左右转向，tok[2] 用作前后速度，tok[3]/tok[4] 不处理。
-     */
     turnRaw = atoi(tok[1]);
     forwardRaw = atoi(tok[2]);
 
@@ -699,7 +635,6 @@ static void Main_ApplyPacket(char *payload)
         return;
     }
 
-    /* key 包：模式切换、急停、解锁。 */
     if (str_is_name(tok[0], "key", "k", 0))
     {
         if (n >= 3 && str_is_down(tok[2]))
@@ -728,7 +663,6 @@ static void Main_ApplyPacket(char *payload)
         return;
     }
 
-    /* slider 包：RP 限速 + 在线调参。 */
     if (str_is_name(tok[0], "slider", "s", 0))
     {
         if (n >= 3)
@@ -738,14 +672,12 @@ static void Main_ApplyPacket(char *payload)
         return;
     }
 
-    /* joystick 包：蓝牙遥控模式使用。 */
     if (str_is_name(tok[0], "joystick", "j", 0))
     {
         Main_ApplyJoystickPacket(tok, n);
         return;
     }
 
-    /* 兼容串口助手直接命令：[cmd,forward,turn]。 */
     if (str_is_name(tok[0], "cmd", "car", "vel"))
     {
         float maxForward;
@@ -814,8 +746,120 @@ static void Main_BTProcess(void)
 }
 
 /* ================================================================
- * 9. 八路灰度循迹算法
+ * 9. 八路灰度循迹算法 + main.c GPIO 直读
  * ================================================================ */
+
+#define LINE_AD0_PORT      GPIOA
+#define LINE_AD0_PIN       GPIO_Pin_8
+
+#define LINE_AD1_PORT      GPIOB
+#define LINE_AD1_PIN       GPIO_Pin_3
+
+#define LINE_AD2_PORT      GPIOB
+#define LINE_AD2_PIN       GPIO_Pin_4
+
+#define LINE_OUT_PORT      GPIOB
+#define LINE_OUT_PIN       GPIO_Pin_0
+
+static void Line_GPIOForceInit(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
+
+    /* PB3/PB4 默认属于 JTAG。这里强制关闭 JTAG，只保留 SWD。 */
+    GPIO_PinRemapConfig(GPIO_Remap_SWJ_JTAGDisable, ENABLE);
+
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+
+    GPIO_InitStructure.GPIO_Pin = LINE_AD0_PIN;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    GPIO_InitStructure.GPIO_Pin = LINE_AD1_PIN | LINE_AD2_PIN;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_InitStructure.GPIO_Pin = LINE_OUT_PIN;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    GPIO_ResetBits(LINE_AD0_PORT, LINE_AD0_PIN);
+    GPIO_ResetBits(LINE_AD1_PORT, LINE_AD1_PIN);
+    GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
+}
+
+static void Line_SelectChannelDirect(uint8_t channel)
+{
+    if (channel & 0x01U)
+    {
+        GPIO_SetBits(LINE_AD0_PORT, LINE_AD0_PIN);
+    }
+    else
+    {
+        GPIO_ResetBits(LINE_AD0_PORT, LINE_AD0_PIN);
+    }
+
+    if (channel & 0x02U)
+    {
+        GPIO_SetBits(LINE_AD1_PORT, LINE_AD1_PIN);
+    }
+    else
+    {
+        GPIO_ResetBits(LINE_AD1_PORT, LINE_AD1_PIN);
+    }
+
+    if (channel & 0x04U)
+    {
+        GPIO_SetBits(LINE_AD2_PORT, LINE_AD2_PIN);
+    }
+    else
+    {
+        GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
+    }
+
+    for (volatile uint16_t d = 0; d < 2000; d++)
+    {
+        __NOP();
+    }
+}
+
+static uint8_t Line_ReadOneDirect(uint8_t channel)
+{
+    uint8_t a;
+    uint8_t b;
+    uint8_t c;
+
+    Line_SelectChannelDirect(channel);
+
+    a = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
+
+    for (volatile uint16_t d = 0; d < 300; d++)
+    {
+        __NOP();
+    }
+
+    b = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
+
+    for (volatile uint16_t d = 0; d < 300; d++)
+    {
+        __NOP();
+    }
+
+    c = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
+
+    return (uint8_t)(((uint16_t)a + (uint16_t)b + (uint16_t)c) >= 2U);
+}
+
+static void Line_ReadAllDirect(uint8_t raw[GRAYSCALE_CHANNELS])
+{
+    uint8_t i;
+
+    for (i = 0; i < GRAYSCALE_CHANNELS; i++)
+    {
+        raw[i] = Line_ReadOneDirect(i);
+    }
+}
 
 static void Line_Update(void)
 {
@@ -834,7 +878,16 @@ static void Line_Update(void)
     blackLevel = (g_lineBlackLevelF <= 0.5f) ? 0U : 1U;
     reverseOrder = (g_lineReverseOrderF <= 0.5f) ? 0U : 1U;
 
-    Grayscale_ReadAll(raw);
+    Line_ReadAllDirect(raw);
+
+    g_lineRawMask = 0;
+    for (i = 0; i < GRAYSCALE_CHANNELS; i++)
+    {
+        if (raw[i] == blackLevel)
+        {
+            g_lineRawMask |= (uint8_t)(1U << i);
+        }
+    }
 
     for (i = 0; i < GRAYSCALE_CHANNELS; i++)
     {
@@ -890,7 +943,6 @@ static float Line_CalcTurnCmd(void)
     g_lineLastCtrlError = error;
 
     desiredSign = (((-g_lineTurnSign) * error) >= 0.0f) ? 1.0f : -1.0f;
-
     turn = (-g_lineTurnSign) * (error * g_lineKp + dError * g_lineKd);
 
     if (absf_local(error) > 70.0f && absf_local(turn) < g_lineMinTurn)
@@ -898,7 +950,6 @@ static float Line_CalcTurnCmd(void)
         turn = desiredSign * g_lineMinTurn;
     }
 
-    /* 0xC3 覆盖最左两路和最右两路。外侧触发时加大转向，帮助过弯。 */
     if ((g_lineMask & 0xC3U) != 0U)
     {
         turn += desiredSign * g_lineEdgeTurnExtra;
@@ -962,8 +1013,76 @@ static void Tracing_Control10ms(void)
 }
 
 /* ================================================================
- * 10. 网页绘图回传与 OLED 本地显示
+ * 10. 速度闭环、电机输出、显示和按键
  * ================================================================ */
+
+static void Control_Run10ms(void)
+{
+    int16_t leftDelta;
+    int16_t rightDelta;
+    float pwmLimit;
+    int32_t leftPwmTemp;
+    int32_t rightPwmTemp;
+
+    leftDelta = Encoder_GetLeftDelta();
+    rightDelta = Encoder_GetRightDelta();
+
+    g_leftSpeed = (float)leftDelta;
+    g_rightSpeed = (float)rightDelta;
+    g_forwardSpeed = (g_leftSpeed + g_rightSpeed) * 0.5f;
+    g_turnSpeed = (g_rightSpeed - g_leftSpeed) * 0.5f;
+
+    if (g_safetyLocked)
+    {
+        Control_ForcePWMZero();
+        return;
+    }
+
+    Control_UpdatePIDParam();
+
+    if (g_workMode == WORK_TRACING)
+    {
+        Tracing_Control10ms();
+    }
+    else
+    {
+        if (g_lastCmdTickMs > BT_TIMEOUT_MS)
+        {
+            g_targetForwardSpeed = 0.0f;
+            g_targetTurnSpeed = 0.0f;
+            g_carEnable = 0;
+        }
+    }
+
+    if (!g_carEnable || g_pwmLimit <= 0.5f)
+    {
+        g_forwardSpeedError = g_targetForwardSpeed - g_forwardSpeed;
+        g_speedPwm = 0.0f;
+        g_diffPwm = 0.0f;
+        g_leftPwm = 0;
+        g_rightPwm = 0;
+        Motor_StopAll();
+        PID_Reset(&ForwardPID);
+        PID_Reset(&TurnPID);
+        return;
+    }
+
+    pwmLimit = limit_float(g_pwmLimit, PWM_LIMIT_MIN, PWM_LIMIT_MAX);
+    ForwardPID.OutputLimit = pwmLimit;
+    TurnPID.OutputLimit = pwmLimit * 0.85f;
+
+    g_forwardSpeedError = g_targetForwardSpeed - g_forwardSpeed;
+    g_speedPwm = PID_Calc(&ForwardPID, g_targetForwardSpeed, g_forwardSpeed);
+    g_diffPwm = PID_Calc(&TurnPID, g_targetTurnSpeed, g_turnSpeed);
+
+    leftPwmTemp = (int32_t)(g_speedPwm - g_diffPwm);
+    rightPwmTemp = (int32_t)(g_speedPwm + g_diffPwm);
+
+    g_leftPwm = limit_i16(leftPwmTemp, (int16_t)(-pwmLimit), (int16_t)pwmLimit);
+    g_rightPwm = limit_i16(rightPwmTemp, (int16_t)(-pwmLimit), (int16_t)pwmLimit);
+
+    Motor_SetPWM(g_leftPwm, g_rightPwm);
+}
 
 static char *ModeString(void)
 {
@@ -978,36 +1097,91 @@ static char *ModeString(void)
     return "BT";
 }
 
+
 static void Serial_SendPlotStatus(void)
 {
+    int modeCode;
+
     /*
      * 调参网页绘图协议：短格式 [p,数值1,数值2,...]
      * 依次回传：
-     *   1. 当前设定速度目标：g_targetForwardSpeed
-     *   2. 当前前进速度 PID 输出 PWM：g_speedPwm
-     *   3. 前进速度误差：g_forwardSpeedError = 目标速度 - 实际速度
-     *   4. 左轮最终 PWM：g_leftPwm
-     *   5. 右轮最终 PWM：g_rightPwm
+     * CH1  modeCode：0=蓝牙遥控，1=循迹，9=急停锁定
+     * CH2  灰度误差：g_lineError
+     * CH3  灰度 Mask：g_lineMask
+     * CH4  目标前进速度：g_targetForwardSpeed
+     * CH5  实际前进速度：g_forwardSpeed
+     * CH6  目标转向速度：g_targetTurnSpeed
+     * CH7  实际转向速度：g_turnSpeed
+     * CH8  左轮 PWM：g_leftPwm
+     * CH9  右轮 PWM：g_rightPwm
+     * CH10 灰度有效标志：g_lineValid
      */
-    Serial_Printf("[p,%d,%d,%d,%d,%d]\r\n",
+
+    modeCode = g_safetyLocked ? 9 : (int)g_workMode;
+
+    Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
+                  modeCode,
+                  (int)g_lineError,
+                  (int)g_lineMask,
                   (int)g_targetForwardSpeed,
-                  (int)g_speedPwm,
-                  (int)g_forwardSpeedError,
+                  (int)g_forwardSpeed,
+                  (int)g_targetTurnSpeed,
+                  (int)g_turnSpeed,
                   (int)g_leftPwm,
-                  (int)g_rightPwm);
+                  (int)g_rightPwm,
+                  (int)g_lineValid);
 }
+
 
 static void OLED_ShowStatus(void)
 {
     OLED_Printf(0, 0, OLED_8X16, "M:%s LK:%d RP:%03d", ModeString(), (int)g_safetyLocked, (int)g_btSpeedLimitPercent);
     OLED_Printf(0, 16, OLED_8X16, "T:%+04d V:%+04d", (int)g_targetForwardSpeed, (int)g_forwardSpeed);
     OLED_Printf(0, 32, OLED_8X16, "L:%+04d R:%+04d", (int)g_leftPwm, (int)g_rightPwm);
-    OLED_Printf(0, 48, OLED_8X16, "E:%+04d M:%02X", (int)g_lineError, (int)g_lineMask);
+    OLED_Printf(0, 48, OLED_8X16, "R:%02X M:%02X E:%+03d", (int)g_lineRawMask, (int)g_lineMask, (int)(g_lineError / 10));
     OLED_Update();
 }
 
+static void Main_KeyProcess(void)
+{
+    uint8_t key;
+
+    key = Key_GetNum();
+    if (key == 0U)
+    {
+        return;
+    }
+
+    if (key == 1U)
+    {
+        ApplySpeedLimitPercent(0.0f);
+        Control_ForcePWMZero();
+        Prompt_Start(160);
+        return;
+    }
+
+    if (key == 2U)
+    {
+        if (g_safetyLocked)
+        {
+            Prompt_Start(80);
+            return;
+        }
+
+        if (g_workMode == WORK_BT)
+        {
+            App_StartTracingMode();
+        }
+        else
+        {
+            App_StartBluetoothMode();
+        }
+        return;
+    }
+}
+
 /* ================================================================
- * 11. 主函数
+ * 11. 主函数和 1ms 定时中断
  * ================================================================ */
 
 int main(void)
@@ -1018,6 +1192,10 @@ int main(void)
     Grayscale_Init();
     Motor_Init();
     Encoder_Init();
+
+    /* 放在可能碰到 AFIO/JTAG/GPIO 的初始化后面，再强制配置一次灰度接口。 */
+    Line_GPIOForceInit();
+
     Serial_Init();
     Timer_Init();
     Control_Init();
@@ -1033,26 +1211,22 @@ int main(void)
 
     while (1)
     {
-        /* 只使用 main.c 内置解析器，不调用 BT_Process()，因此 Hardware 文件夹无需改动。 */
         Main_BTProcess();
-
-        if (g_oledRefreshMs >= OLED_REFRESH_PERIOD_MS)
-        {
-            g_oledRefreshMs = 0;
-            OLED_ShowStatus();
-        }
+        Main_KeyProcess();
 
         if (g_plotReportMs >= PLOT_REPORT_PERIOD_MS)
         {
             g_plotReportMs = 0;
             Serial_SendPlotStatus();
         }
+
+        if (g_oledRefreshMs >= OLED_REFRESH_PERIOD_MS)
+        {
+            g_oledRefreshMs = 0;
+            OLED_ShowStatus();
+        }
     }
 }
-
-/* ================================================================
- * 12. TIM1 1ms 中断：控制核心
- * ================================================================ */
 
 void TIM1_UP_IRQHandler(void)
 {
@@ -1060,21 +1234,21 @@ void TIM1_UP_IRQHandler(void)
 
     if (TIM_GetITStatus(TIM1, TIM_IT_Update) == SET)
     {
-        int16_t leftDelta;
-        int16_t rightDelta;
+        TIM_ClearITPendingBit(TIM1, TIM_IT_Update);
 
         Key_Tick();
         Prompt_Tick1ms();
 
-        if (g_lastCmdTickMs < 0xFFFFFFFFUL)
+        if (g_lastCmdTickMs < 60000U)
         {
             g_lastCmdTickMs++;
         }
-        if (g_oledRefreshMs < 1000U)
+
+        if (g_oledRefreshMs < 60000U)
         {
             g_oledRefreshMs++;
         }
-        if (g_plotReportMs < 1000U)
+        if (g_plotReportMs < 60000U)
         {
             g_plotReportMs++;
         }
@@ -1082,67 +1256,8 @@ void TIM1_UP_IRQHandler(void)
         controlDiv++;
         if (controlDiv >= CONTROL_PERIOD_MS)
         {
-            float forwardTarget;
-            float turnTarget;
-            float leftCommand;
-            float rightCommand;
-
             controlDiv = 0;
-            Control_UpdatePIDParam();
-
-            leftDelta = Encoder_GetLeftDelta();
-            rightDelta = Encoder_GetRightDelta();
-
-            g_leftSpeed = (float)leftDelta;
-            g_rightSpeed = (float)rightDelta;
-            g_forwardSpeed = (g_leftSpeed + g_rightSpeed) * 0.5f;
-            g_turnSpeed = (g_rightSpeed - g_leftSpeed) * 0.5f;
-
-            if (g_safetyLocked)
-            {
-                Control_ForcePWMZero();
-            }
-            else
-            {
-                if (g_workMode == WORK_TRACING)
-                {
-                    Tracing_Control10ms();
-                }
-                else
-                {
-                    /* 蓝牙遥控模式超时保护。 */
-                    if (g_lastCmdTickMs > BT_TIMEOUT_MS)
-                    {
-                        g_targetForwardSpeed = 0.0f;
-                        g_targetTurnSpeed = 0.0f;
-                        g_carEnable = 0;
-                    }
-                }
-
-                if (!g_carEnable && absf_local(g_targetForwardSpeed) < 0.01f && absf_local(g_targetTurnSpeed) < 0.01f)
-                {
-                    Control_ForcePWMZero();
-                }
-                else
-                {
-                    forwardTarget = g_carEnable ? g_targetForwardSpeed : 0.0f;
-                    turnTarget = g_carEnable ? g_targetTurnSpeed : 0.0f;
-
-                    g_forwardSpeedError = forwardTarget - g_forwardSpeed;
-                    g_speedPwm = PID_Calc(&ForwardPID, forwardTarget, g_forwardSpeed);
-                    g_diffPwm = PID_Calc(&TurnPID, turnTarget, g_turnSpeed);
-
-                    leftCommand = g_speedPwm - g_diffPwm;
-                    rightCommand = g_speedPwm + g_diffPwm;
-
-                    g_leftPwm = limit_i16((int32_t)leftCommand, -(int16_t)g_pwmLimit, (int16_t)g_pwmLimit);
-                    g_rightPwm = limit_i16((int32_t)rightCommand, -(int16_t)g_pwmLimit, (int16_t)g_pwmLimit);
-
-                    Motor_SetPWM(g_leftPwm, g_rightPwm);
-                }
-            }
+            Control_Run10ms();
         }
-
-        TIM_ClearITPendingBit(TIM1, TIM_IT_Update);
     }
 }
