@@ -1,0 +1,19 @@
+# 默认忽略所有文件
+*
+
+# 允许文件夹本身被 Git 进入
+!Hardware/
+!User/
+!System/
+
+# 允许上传 Hardware 全部文件
+!Hardware/**
+
+# 只允许上传 User/main.c
+!User/main.c
+
+# 允许上传 System 全部文件
+!System/**
+
+# 允许上传 .gitignore 自己
+!.gitignore

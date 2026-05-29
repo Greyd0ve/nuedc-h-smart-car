@@ -21,8 +21,8 @@
  *   如果你更换电机线序或左右电机安装方向后前进又反了，只需要改这两个宏，
  *   不要去改蓝牙解析、循迹 PID 或状态机。
  */
-#define LEFT_MOTOR_DIR_SIGN     (+1)
-#define RIGHT_MOTOR_DIR_SIGN    (-1)
+#define LEFT_MOTOR_DIR_SIGN     (-1)
+#define RIGHT_MOTOR_DIR_SIGN    (+1)
 
 static int16_t Motor_ClampPWM(int16_t pwm)
 {

@@ -1,15 +1,11 @@
 /*
  * 文件：User/main.c
- * 版本：Bluetooth + 8路灰度循迹精简调参版 + main.c 灰度直读排查版 + AD1改PB3/AD2改PB4版
- *
+ * 版本：Bluetooth + 8路灰度循迹精简调参版 + main.c 灰度直读排查版 + presetFast版
  *
  * 本版新增：
- *   1. 在 main.c 内部强制重新初始化八路灰度 GPIO：AD0=PA8、AD1=PB3、AD2=PB4、OUT=PB0。
- *   2. 在 main.c 内部直接切换 AD0/AD1/AD2 并读取 OUT，绕过 Grayscale_ReadAll()。
- *   3. OLED 最后一行显示 R/M/E：
- *        R = 原始直读掩码，不受 lineReverse 影响，用于排查 AD1 是否生效；
- *        M = 实际参与循迹计算的掩码；
- *        E = 缩小后的循迹误差。
+ *   1. 网页发送 [key,presetFast,down] 可加载高速稳定参数 v1。
+ *   2. 物理按键 SW3/K3 可加载高速稳定参数 v1。
+ *   3. 加载高速参数只修改参数，不自动启动、不自动切换模式，避免破坏急停/解锁安全逻辑。
  *
  * 功能总览：
  *   1. 上电默认进入蓝牙遥控模式。
@@ -21,6 +17,7 @@
  *   7. 支持网页滑杆在线调 PID、循迹、速度、滤波、斜坡等重要参数。
  *   8. SW1/K1：把 RP 设置为 0%，PWM 立即清零，但不进入急停锁定。
  *   9. SW2/K2：在蓝牙遥控模式和循迹模式之间切换；急停锁定时无效。
+ *   10. SW3/K3：加载高速稳定参数 v1。
  */
 
 #include "stm32f10x.h"
@@ -439,6 +436,38 @@ static void ApplySpeedLimitPercent(float percent)
     g_pwmLimit = PWM_LIMIT_MAX * ratio;
 }
 
+static void ApplyFastPreset(void)
+{
+    /* 高速稳定参数 v1 / 约 5.2s 圈速版。
+     * 只加载调参参数，不自动切换模式，不自动启动小车。
+     */
+    ApplySpeedLimitPercent(55.0f);
+
+    g_traceBaseSpeed = 60.0f;
+    g_lineKp = 0.350f;
+    g_lineKd = 0.600f;
+    g_lineTurnLimit = 180.0f;
+    g_lineMinTurn = 34.0f;
+    g_lineFilterAlpha = 0.58f;
+    g_lineSlowGain = 0.88f;
+    g_lineEdgeTurnExtra = 82.0f;
+    g_lineEdgeSpeedRatio = 0.24f;
+    g_forwardSlewStep = 14.0f;
+    g_turnSlewStep = 60.0f;
+    g_lineLostTurn = 130.0f;
+
+    g_lineTurnSign = 1.0f;
+    g_lineBlackLevelF = 1.0f;
+    g_lineReverseOrderF = 0.0f;
+
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(220);
+}
+
 static void Main_ApplySliderPacket(const char *name, float value)
 {
     if (str_is_name(name, "RP", "rp", "speedLimit"))
@@ -649,6 +678,11 @@ static void Main_ApplyPacket(char *payload)
                 App_UnlockControl();
                 return;
             }
+            if (str_is_name(tok[1], "presetFast", "fast", "fastPreset"))
+            {
+                ApplyFastPreset();
+                return;
+            }
             if (str_is_name(tok[1], "tracing", "trace", "line"))
             {
                 App_StartTracingMode();
@@ -768,7 +802,6 @@ static void Line_GPIOForceInit(void)
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
 
-    /* PB3/PB4 默认属于 JTAG。这里强制关闭 JTAG，只保留 SWD。 */
     GPIO_PinRemapConfig(GPIO_Remap_SWJ_JTAGDisable, ENABLE);
 
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
@@ -791,6 +824,8 @@ static void Line_GPIOForceInit(void)
 
 static void Line_SelectChannelDirect(uint8_t channel)
 {
+    volatile uint16_t d;
+
     if (channel & 0x01U)
     {
         GPIO_SetBits(LINE_AD0_PORT, LINE_AD0_PIN);
@@ -818,7 +853,7 @@ static void Line_SelectChannelDirect(uint8_t channel)
         GPIO_ResetBits(LINE_AD2_PORT, LINE_AD2_PIN);
     }
 
-    for (volatile uint16_t d = 0; d < 2000; d++)
+    for (d = 0; d < 2000; d++)
     {
         __NOP();
     }
@@ -829,19 +864,20 @@ static uint8_t Line_ReadOneDirect(uint8_t channel)
     uint8_t a;
     uint8_t b;
     uint8_t c;
+    volatile uint16_t d;
 
     Line_SelectChannelDirect(channel);
 
     a = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
 
-    for (volatile uint16_t d = 0; d < 300; d++)
+    for (d = 0; d < 300; d++)
     {
         __NOP();
     }
 
     b = (uint8_t)GPIO_ReadInputDataBit(LINE_OUT_PORT, LINE_OUT_PIN);
 
-    for (volatile uint16_t d = 0; d < 300; d++)
+    for (d = 0; d < 300; d++)
     {
         __NOP();
     }
@@ -1097,25 +1133,9 @@ static char *ModeString(void)
     return "BT";
 }
 
-
 static void Serial_SendPlotStatus(void)
 {
     int modeCode;
-
-    /*
-     * 调参网页绘图协议：短格式 [p,数值1,数值2,...]
-     * 依次回传：
-     * CH1  modeCode：0=蓝牙遥控，1=循迹，9=急停锁定
-     * CH2  灰度误差：g_lineError
-     * CH3  灰度 Mask：g_lineMask
-     * CH4  目标前进速度：g_targetForwardSpeed
-     * CH5  实际前进速度：g_forwardSpeed
-     * CH6  目标转向速度：g_targetTurnSpeed
-     * CH7  实际转向速度：g_turnSpeed
-     * CH8  左轮 PWM：g_leftPwm
-     * CH9  右轮 PWM：g_rightPwm
-     * CH10 灰度有效标志：g_lineValid
-     */
 
     modeCode = g_safetyLocked ? 9 : (int)g_workMode;
 
@@ -1131,7 +1151,6 @@ static void Serial_SendPlotStatus(void)
                   (int)g_rightPwm,
                   (int)g_lineValid);
 }
-
 
 static void OLED_ShowStatus(void)
 {
@@ -1176,6 +1195,12 @@ static void Main_KeyProcess(void)
         {
             App_StartBluetoothMode();
         }
+        return;
+    }
+
+    if (key == 3U)
+    {
+        ApplyFastPreset();
         return;
     }
 }

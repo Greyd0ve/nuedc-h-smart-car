@@ -21,7 +21,7 @@
  * 如果小车前进时网页 CH5 实际前进速度为负，优先把这两个符号同时取反。
  * 如果只有某一侧轮子方向反了，只单独修改对应一侧。
  */
-#define LEFT_ENCODER_SIGN   (+1)
+#define LEFT_ENCODER_SIGN   (-1)
 #define RIGHT_ENCODER_SIGN  (+1)
 
 void Encoder_Init(void)
