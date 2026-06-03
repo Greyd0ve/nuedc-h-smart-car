@@ -1,7 +1,7 @@
 /*
  * 文件：User/main.c
  * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示
- *       + 编码器累计调试 + MPU6050 yaw 诊断调试版。
+ *       + 编码器累计调试 + MPU6050 yaw 调试 + straight 直线航向保持测试版。
  *
  * 本版说明：
  *   1. 不再使用 PC13 板载 LED。
@@ -10,8 +10,9 @@
  *   4. Prompt_Start()/Prompt_Tick1ms() 只控制 PB1 和 PB5。
  *   5. 保留编码器累计调试模式，用于 100 cm 距离标定。
  *   6. 新增 MPU6050 yaw 调试模式，用于 GyroZ 零偏校准、yaw 积分和网页/OLED 回传。
- *   7. 新增 MPU6050 诊断信息：错误码、WHO_AM_I 读数、初始化尝试次数。
- *   7. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
+ *   7. 保留 MPU6050 诊断信息：错误码、WHO_AM_I 读数、初始化尝试次数。
+ *   8. 新增 [key,straight,down] 直线航向保持测试。
+ *   9. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
  *      再按一次 K2/SW2 返回普通 BT 显示模式。
  *
  * 保留功能：
@@ -26,6 +27,7 @@
  *   9. 网页发送 [key,presetFast,down] 加载高速稳定参数 v1。
  *   10. K3/SW3 加载高速稳定参数 v1。
  *   11. K4/SW4 清零编码器累计脉冲。
+ *   12. [key,straight,down] 使用编码器距离 + MPU6050 yaw 保持直线并自动停车。
  */
 
 #include "stm32f10x.h"
@@ -59,6 +61,10 @@
 /* MPU6050 静止校准参数：300 次，每次约 3ms，总时长约 0.9s。 */
 #define MPU_CALIB_SAMPLES              300U
 #define MPU_CALIB_MIN_OK               240U
+
+/* 直线距离标定结果：100cm 约 7030 个左右平均编码器脉冲。 */
+#define ENCODER_PULSE_PER_CM           70.30f
+#define STRAIGHT_DISTANCE_DEFAULT      7030.0f
 
 /* ================================================================
  * 2. 八路灰度循迹默认参数
@@ -147,7 +153,7 @@ volatile int32_t g_rightEncoderTotal = 0;
 volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
-/* 0 = 普通网页回传，1 = 编码器调试回传，2 = MPU6050 yaw 调试回传。 */
+/* 0 = 普通网页回传，1 = 编码器调试回传，2 = MPU6050 yaw 调试回传，3 = straight 直线测试回传。 */
 volatile uint8_t g_plotMode = 0;
 
 volatile float g_speedPwm = 0.0f;
@@ -196,6 +202,18 @@ volatile float g_gyroZBiasDps = 0.0f;
 volatile float g_gyroZDps = 0.0f;
 volatile float g_yawDeg = 0.0f;
 volatile float g_yawTotalDeg = 0.0f;
+
+/* straight 直线航向保持测试参数。
+ * g_straightDistancePulse 使用编码器平均累计脉冲作为距离单位。
+ */
+volatile uint8_t g_straightActive = 0;
+volatile uint8_t g_straightDone = 0;
+volatile float g_straightSpeed = 18.0f;
+volatile float g_straightDistancePulse = STRAIGHT_DISTANCE_DEFAULT;
+volatile float g_straightTargetYaw = 0.0f;
+volatile float g_straightYawError = 0.0f;
+volatile float g_yawKp = 1.8f;
+volatile float g_yawKd = 0.15f;
 
 /* ================================================================
  * 5. 小工具函数
@@ -489,6 +507,7 @@ static void Control_UpdatePIDParam(void)
 
 static void Control_ForcePWMZero(void)
 {
+    g_straightActive = 0;
     g_targetForwardSpeed = 0.0f;
     g_targetTurnSpeed = 0.0f;
     g_speedPwm = 0.0f;
@@ -682,7 +701,92 @@ static void MPU_CalibrateGyroZ(void)
 }
 
 /* ================================================================
- * 9. 模式切换和安全锁定
+ * 9. straight 直线航向保持测试
+ * ================================================================ */
+
+static void Straight_Start(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (!g_mpuReady)
+    {
+        MPU_AppInit();
+    }
+
+    /* 直线航向保持依赖 yaw 零偏校准。未校准时不启动，避免小车跑偏。 */
+    if (!g_mpuReady || !g_mpuCalibrated)
+    {
+        g_plotMode = 2U;
+        Control_ForcePWMZero();
+        Prompt_Start(900);
+        return;
+    }
+
+    g_workMode = WORK_BT;
+    g_plotMode = 3U;
+    g_straightDone = 0;
+
+    Control_ForcePWMZero();
+    Encoder_DebugClearTotals();
+
+    g_straightTargetYaw = g_yawDeg;
+    g_straightYawError = 0.0f;
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 1;
+    g_straightActive = 1;
+    g_lastCmdTickMs = 0;
+
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(180);
+}
+
+static void Straight_Finish(void)
+{
+    g_straightActive = 0;
+    g_straightDone = 1;
+    Control_ForcePWMZero();
+    g_plotMode = 3U;
+    Prompt_Start(500);
+}
+
+static void Straight_Control10ms(void)
+{
+    float targetDistance;
+    float turnCmd;
+
+    if (!g_straightActive)
+    {
+        return;
+    }
+
+    targetDistance = limit_float(g_straightDistancePulse, 0.0f, 30000.0f);
+
+    if ((float)g_forwardEncoderTotal >= targetDistance)
+    {
+        Straight_Finish();
+        return;
+    }
+
+    g_straightYawError = wrap_180(g_straightTargetYaw - g_yawDeg);
+
+    /* 航向保持：偏航角误差负责拉回方向，GyroZ 项用于抑制摆动。 */
+    turnCmd = g_yawKp * g_straightYawError - g_yawKd * g_gyroZDps;
+    turnCmd = limit_float(turnCmd, -g_maxTurnCmd, g_maxTurnCmd);
+
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, g_straightSpeed, g_forwardSlewStep);
+    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turnCmd, g_turnSlewStep);
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+}
+
+/* ================================================================
+ * 10. 模式切换和安全锁定
  * ================================================================ */
 
 void App_EmergencyStop(void)
@@ -722,6 +826,7 @@ void App_StartTracingMode(void)
         return;
     }
 
+    g_straightActive = 0;
     g_workMode = WORK_TRACING;
     g_lineLostMs = 0;
     g_lineErrorFiltered = 0.0f;
@@ -934,15 +1039,44 @@ static void Main_ApplySliderPacket(const char *name, float value)
         {
             g_plotMode = 1U;
         }
-        else
+        else if (value < 2.5f)
         {
             g_plotMode = 2U;
+        }
+        else
+        {
+            g_plotMode = 3U;
         }
         return;
     }
     if (str_is_name(name, "yawSign", "gyroSign", "mpuSign"))
     {
         g_mpuYawSign = (value < 0.0f) ? -1.0f : 1.0f;
+        return;
+    }
+    if (str_is_name(name, "yawKp", "headingKp", "straightKp"))
+    {
+        g_yawKp = limit_float(value, 0.0f, 20.0f);
+        return;
+    }
+    if (str_is_name(name, "yawKd", "headingKd", "straightKd"))
+    {
+        g_yawKd = limit_float(value, 0.0f, 10.0f);
+        return;
+    }
+    if (str_is_name(name, "straightSpeed", "straightV", "lineV"))
+    {
+        g_straightSpeed = limit_float(value, 0.0f, 80.0f);
+        return;
+    }
+    if (str_is_name(name, "straightDistance", "straightPulse", "straightDist"))
+    {
+        g_straightDistancePulse = limit_float(value, 0.0f, 30000.0f);
+        return;
+    }
+    if (str_is_name(name, "straightCm", "distanceCm", "distCm"))
+    {
+        g_straightDistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
         return;
     }
 }
@@ -958,7 +1092,7 @@ static void Main_ApplyJoystickPacket(char **tok, int n)
     {
         return;
     }
-    if (g_safetyLocked || g_workMode != WORK_BT)
+    if (g_safetyLocked || g_straightActive || g_workMode != WORK_BT)
     {
         return;
     }
@@ -1048,6 +1182,11 @@ static void Main_ApplyPacket(char *payload)
             {
                 MPU_ResetYaw();
                 Prompt_Start(180);
+                return;
+            }
+            if (str_is_name(tok[1], "straight", "straightTest", "goStraight"))
+            {
+                Straight_Start();
                 return;
             }
             if (str_is_name(tok[1], "plotNormal", "normalPlot", "plot0"))
@@ -1454,7 +1593,11 @@ static void Control_Run10ms(void)
 
     Control_UpdatePIDParam();
 
-    if (g_workMode == WORK_TRACING)
+    if (g_straightActive)
+    {
+        Straight_Control10ms();
+    }
+    else if (g_workMode == WORK_TRACING)
     {
         Tracing_Control10ms();
     }
@@ -1504,6 +1647,10 @@ static char *ModeString(void)
     {
         return "LOCK";
     }
+    if (g_straightActive)
+    {
+        return "STR";
+    }
     if (g_workMode == WORK_TRACING)
     {
         return "TRACE";
@@ -1515,7 +1662,7 @@ static void Serial_SendPlotStatus(void)
 {
     int modeCode;
 
-    modeCode = g_safetyLocked ? 9 : (int)g_workMode;
+    modeCode = g_safetyLocked ? 9 : (g_straightActive ? 3 : (int)g_workMode);
 
     if (g_plotMode == 1U)
     {
@@ -1575,6 +1722,35 @@ static void Serial_SendPlotStatus(void)
         return;
     }
 
+    if (g_plotMode == 3U)
+    {
+        /*
+         * straight 直线测试回传格式：
+         * CH1  modeCode：3=straight 正在执行，9=急停
+         * CH2  yaw * 10
+         * CH3  yawError * 10
+         * CH4  GyroZ * 10
+         * CH5  目标前进速度
+         * CH6  目标转向速度
+         * CH7  当前平均累计脉冲
+         * CH8  目标距离脉冲
+         * CH9  左 PWM
+         * CH10 右 PWM
+         */
+        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%ld,%ld,%d,%d]\r\n",
+                      modeCode,
+                      (int)(g_yawDeg * 10.0f),
+                      (int)(g_straightYawError * 10.0f),
+                      (int)(g_gyroZDps * 10.0f),
+                      (int)g_targetForwardSpeed,
+                      (int)g_targetTurnSpeed,
+                      (long)g_forwardEncoderTotal,
+                      (long)g_straightDistancePulse,
+                      (int)g_leftPwm,
+                      (int)g_rightPwm);
+        return;
+    }
+
     Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
                   modeCode,
                   (int)g_lineError,
@@ -1610,6 +1786,16 @@ static void OLED_ShowStatus(void)
         return;
     }
 
+    if (g_plotMode == 3U)
+    {
+        OLED_Printf(0, 0, OLED_8X16, "STR RP:%03d %c", (int)g_btSpeedLimitPercent, g_straightActive ? 'R' : 'S');
+        OLED_Printf(0, 16, OLED_8X16, "D:%+05ld/%05ld", (long)g_forwardEncoderTotal, (long)g_straightDistancePulse);
+        OLED_Printf(0, 32, OLED_8X16, "Y:%+03d E:%+03d", (int)g_yawDeg, (int)g_straightYawError);
+        OLED_Printf(0, 48, OLED_8X16, "T:%+03d P:%+04d", (int)g_targetTurnSpeed, (int)g_forwardSpeed);
+        OLED_Update();
+        return;
+    }
+
     OLED_Printf(0, 0, OLED_8X16, "M:%s LK:%d RP:%03d", ModeString(), (int)g_safetyLocked, (int)g_btSpeedLimitPercent);
     OLED_Printf(0, 16, OLED_8X16, "T:%+04d V:%+04d", (int)g_targetForwardSpeed, (int)g_forwardSpeed);
     OLED_Printf(0, 32, OLED_8X16, "L:%+04d R:%+04d", (int)g_leftPwm, (int)g_rightPwm);
@@ -1637,6 +1823,12 @@ static void Main_KeyProcess(void)
 
     if (key == 2U)
     {
+        if (g_straightActive)
+        {
+            Straight_Finish();
+            return;
+        }
+
         if (g_safetyLocked)
         {
             Prompt_Start(80);
