@@ -2,7 +2,7 @@
  * 文件：User/main.c
  * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示
  *       + 编码器累计调试 + MPU6050 yaw 调试 + straight 直线航向保持测试
- *       + task1 最小状态机版 + arcTest 半圆弧结束判断测试版。
+ *       + task1/task2 状态机版 + arcTest 半圆弧结束判断测试版。
  *
  * 本版说明：
  *   1. 不再使用 PC13 板载 LED。
@@ -15,7 +15,8 @@
  *   8. 保留 [key,straight,down] 直线航向保持测试。
  *   9. 新增 [key,task1,down] 选择 H 题任务 1，[key,start,down] 开始执行。
  *   10. task1 第一版只做 A -> B 直线 100 cm，到 B 停车并声光提示。
- *   11. 新增 [key,arcTest,down] 半圆弧结束判断测试。
+ *   11. 新增 [key,task2,down] + [key,start,down] 执行 A->B->C->D->A 一圈。
+ *   12. 保留 [key,arcTest,down] 半圆弧结束判断测试。
  *   12. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
  *      再按一次 K2/SW2 返回普通 BT 显示模式。
  *
@@ -33,7 +34,8 @@
  *   11. K4/SW4 清零编码器累计脉冲。
  *   12. [key,straight,down] 使用编码器距离 + MPU6050 yaw 保持直线并自动停车。
  *   13. [key,task1,down] + [key,start,down] 执行 H 题 task1：A -> B 停车。
- *   14. [key,arcTest,down] 从半圆弧起点开始循迹，并用 yaw 角度判断半圆结束。
+ *   14. [key,task2,down] + [key,start,down] 执行 H 题 task2：A->B->C->D->A。
+ *   15. [key,arcTest,down] 从半圆弧起点开始循迹，并用 yaw 角度判断半圆结束。
  */
 
 #include "stm32f10x.h"
@@ -154,9 +156,15 @@ typedef enum
 {
     TASK_IDLE = 0,
     TASK_READY_TASK1,
+    TASK_READY_TASK2,
     TASK_STRAIGHT_AB,
     TASK_STOP_AT_B,
-    TASK_FINISH
+    TASK_FINISH,
+    TASK2_STRAIGHT_AB,
+    TASK2_ARC_BC,
+    TASK2_STRAIGHT_CD,
+    TASK2_ARC_DA,
+    TASK2_FINISH
 } TaskState_t;
 
 volatile WorkMode_t g_workMode = WORK_BT;
@@ -261,9 +269,10 @@ volatile float g_arcYawTarget = ARC_YAW_TARGET_DEFAULT;
 volatile float g_arcStartYaw = 0.0f;
 volatile float g_arcDeltaYaw = 0.0f;
 
-/* H 题 task1 最小状态机参数。
- * task1 目标是 A -> B 直线 100 cm，到 B 停车并声光提示。
- * g_task1DistancePulse 表示真实目标距离脉冲，默认 7030。
+/* H 题 task1/task2 状态机参数。
+ * task1：A -> B 直线 100 cm，到 B 停车并声光提示。
+ * task2：A -> B 直线，B -> C 半圆弧，C -> D 直线，D -> A 半圆弧，到 A 停车。
+ * g_taskDistancePulse 表示直线真实目标距离脉冲，默认 7030。
  * g_taskStopOffsetPulse 表示提前停车补偿，默认 170。
  * 实际给 straight 控制使用的停止阈值为：7030 - 170 = 6860。
  */
@@ -271,6 +280,7 @@ volatile TaskState_t g_taskState = TASK_IDLE;
 volatile uint8_t g_taskSelected = 0;
 volatile uint8_t g_taskRunning = 0;
 volatile float g_task1DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
+volatile float g_task2DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_taskStopOffsetPulse = STRAIGHT_STOP_OFFSET_DEFAULT;
 
 /* ================================================================
@@ -804,6 +814,21 @@ static void Straight_Start(void)
     Prompt_Start(180);
 }
 
+static float Task_GetStraightStopThreshold(float realDistancePulse)
+{
+    float stopThreshold;
+
+    stopThreshold = realDistancePulse - g_taskStopOffsetPulse;
+    if (stopThreshold < 0.0f)
+    {
+        stopThreshold = 0.0f;
+    }
+    return stopThreshold;
+}
+
+/* Straight_Finish() 中需要启动下一段半圆弧，因此提前声明 Arc_Start()。 */
+static void Arc_Start(void);
+
 static void Straight_Finish(void)
 {
     g_straightActive = 0;
@@ -818,11 +843,28 @@ static void Straight_Finish(void)
         /* task1 到达 B 点，停车声光提示时间稍长一点，方便观察。 */
         Prompt_Start(800);
         g_taskState = TASK_FINISH;
+        return;
     }
-    else
+
+    if (g_taskState == TASK2_STRAIGHT_AB)
     {
-        Prompt_Start(500);
+        /* task2 到达 B 点：声光短提示，然后进入 B->C 半圆弧循迹。 */
+        g_taskState = TASK2_ARC_BC;
+        Arc_Start();
+        Prompt_Start(250);
+        return;
     }
+
+    if (g_taskState == TASK2_STRAIGHT_CD)
+    {
+        /* task2 到达 D 点：声光短提示，然后进入 D->A 半圆弧循迹。 */
+        g_taskState = TASK2_ARC_DA;
+        Arc_Start();
+        Prompt_Start(250);
+        return;
+    }
+
+    Prompt_Start(500);
 }
 
 static void Straight_Control10ms(void)
@@ -866,6 +908,27 @@ static void Arc_Finish(void)
     g_workMode = WORK_BT;
     Control_ForcePWMZero();
     g_plotMode = 4U;
+
+    if (g_taskState == TASK2_ARC_BC)
+    {
+        /* task2 到达 C 点：进入 C->D 直线段。 */
+        g_taskState = TASK2_STRAIGHT_CD;
+        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task2DistancePulse);
+        Straight_Start();
+        Prompt_Start(250);
+        return;
+    }
+
+    if (g_taskState == TASK2_ARC_DA)
+    {
+        /* task2 回到 A 点：整圈完成，停车并长声光提示。 */
+        g_taskRunning = 0;
+        g_taskState = TASK2_FINISH;
+        g_plotMode = 3U;
+        Prompt_Start(1000);
+        return;
+    }
+
     Prompt_Start(700);
 }
 
@@ -964,6 +1027,7 @@ static void Task_Reset(void)
     g_taskState = TASK_IDLE;
     g_taskSelected = 0;
     g_taskRunning = 0;
+    g_straightActive = 0;
     g_arcActive = 0;
 }
 
@@ -984,41 +1048,66 @@ static void Task_SelectTask1(void)
     Prompt_Start(220);
 }
 
-static void Task_StartSelected(void)
+static void Task_SelectTask2(void)
 {
-    float stopThreshold;
-
     if (g_safetyLocked)
     {
         Prompt_Start(80);
         return;
     }
 
-    if (g_taskState != TASK_READY_TASK1 || g_taskSelected != 1U)
+    g_taskSelected = 2;
+    g_taskRunning = 0;
+    g_taskState = TASK_READY_TASK2;
+    g_workMode = WORK_BT;
+    g_plotMode = 3U;
+    Control_ForcePWMZero();
+    Prompt_Start(260);
+}
+
+static void Task_StartSelected(void)
+{
+    if (g_safetyLocked)
     {
-        Prompt_Start(120);
+        Prompt_Start(80);
         return;
     }
 
-    /* task1 复用已经验证过的 straight 直线控制。网页上保留真实距离 7030，
-     * 程序内部减去停车补偿 170，实际停止点接近 100 cm。
-     */
-    stopThreshold = g_task1DistancePulse - g_taskStopOffsetPulse;
-    if (stopThreshold < 0.0f)
+    if (g_taskSelected == 1U && g_taskState == TASK_READY_TASK1)
     {
-        stopThreshold = 0.0f;
+        /* task1 复用已经验证过的 straight 直线控制。网页上保留真实距离 7030，
+         * 程序内部减去停车补偿 170，实际停止点接近 100 cm。
+         */
+        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task1DistancePulse);
+        g_taskRunning = 1;
+        g_taskState = TASK_STRAIGHT_AB;
+        Straight_Start();
+
+        if (!g_straightActive)
+        {
+            g_taskRunning = 0;
+            g_taskState = TASK_READY_TASK1;
+        }
+        return;
     }
 
-    g_straightDistancePulse = stopThreshold;
-    g_taskRunning = 1;
-    g_taskState = TASK_STRAIGHT_AB;
-    Straight_Start();
-
-    if (!g_straightActive)
+    if (g_taskSelected == 2U && g_taskState == TASK_READY_TASK2)
     {
-        g_taskRunning = 0;
-        g_taskState = TASK_READY_TASK1;
+        /* task2 第一段：A->B 直线。后续段由 Straight_Finish()/Arc_Finish() 自动切换。 */
+        g_straightDistancePulse = Task_GetStraightStopThreshold(g_task2DistancePulse);
+        g_taskRunning = 1;
+        g_taskState = TASK2_STRAIGHT_AB;
+        Straight_Start();
+
+        if (!g_straightActive)
+        {
+            g_taskRunning = 0;
+            g_taskState = TASK_READY_TASK2;
+        }
+        return;
     }
+
+    Prompt_Start(120);
 }
 
 static void Task_Stop(void)
@@ -1351,6 +1440,16 @@ static void Main_ApplySliderPacket(const char *name, float value)
         g_task1DistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
         return;
     }
+    if (str_is_name(name, "task2Distance", "task2Pulse", "cdDistance"))
+    {
+        g_task2DistancePulse = limit_float(value, 0.0f, 30000.0f);
+        return;
+    }
+    if (str_is_name(name, "task2Cm", "task2DistCm", "t2Cm"))
+    {
+        g_task2DistancePulse = limit_float(value, 0.0f, 300.0f) * ENCODER_PULSE_PER_CM;
+        return;
+    }
     if (str_is_name(name, "stopOffset", "straightOffset", "brakeOffset"))
     {
         g_taskStopOffsetPulse = limit_float(value, 0.0f, 2000.0f);
@@ -1484,6 +1583,11 @@ static void Main_ApplyPacket(char *payload)
             if (str_is_name(tok[1], "task1", "selectTask1", "t1"))
             {
                 Task_SelectTask1();
+                return;
+            }
+            if (str_is_name(tok[1], "task2", "selectTask2", "t2"))
+            {
+                Task_SelectTask2();
                 return;
             }
             if (str_is_name(tok[1], "start", "run", "taskStart"))
@@ -1989,7 +2093,13 @@ static void Serial_SendPlotStatus(void)
 {
     int modeCode;
 
-    modeCode = g_safetyLocked ? 9 : (g_straightActive ? 3 : (g_arcActive ? 4 : ((g_taskState == TASK_READY_TASK1) ? 11 : ((g_taskState == TASK_FINISH) ? 12 : (int)g_workMode))));
+    modeCode = g_safetyLocked ? 9 :
+               (g_straightActive ? 3 :
+               (g_arcActive ? 4 :
+               ((g_taskState == TASK_READY_TASK1) ? 11 :
+               ((g_taskState == TASK_READY_TASK2) ? 21 :
+               ((g_taskState == TASK_FINISH) ? 12 :
+               ((g_taskState == TASK2_FINISH) ? 22 : (int)g_workMode))))));
 
     if (g_plotMode == 1U)
     {
