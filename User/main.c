@@ -2,7 +2,7 @@
  * 文件：User/main.c
  * 版本：蓝牙遥控 + 八路灰度循迹 + presetFast + PB1/PB5 声光提示
  *       + 编码器累计调试 + MPU6050 yaw 调试 + straight 直线航向保持测试
- *       + task1 最小状态机版。
+ *       + task1 最小状态机版 + arcTest 半圆弧结束判断测试版。
  *
  * 本版说明：
  *   1. 不再使用 PC13 板载 LED。
@@ -15,7 +15,8 @@
  *   8. 保留 [key,straight,down] 直线航向保持测试。
  *   9. 新增 [key,task1,down] 选择 H 题任务 1，[key,start,down] 开始执行。
  *   10. task1 第一版只做 A -> B 直线 100 cm，到 B 停车并声光提示。
- *   11. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
+ *   11. 新增 [key,arcTest,down] 半圆弧结束判断测试。
+ *   12. 开机默认普通 BT 模式，按下 K2/SW2 后切换到编码器调试模式；
  *      再按一次 K2/SW2 返回普通 BT 显示模式。
  *
  * 保留功能：
@@ -32,6 +33,7 @@
  *   11. K4/SW4 清零编码器累计脉冲。
  *   12. [key,straight,down] 使用编码器距离 + MPU6050 yaw 保持直线并自动停车。
  *   13. [key,task1,down] + [key,start,down] 执行 H 题 task1：A -> B 停车。
+ *   14. [key,arcTest,down] 从半圆弧起点开始循迹，并用 yaw 角度判断半圆结束。
  */
 
 #include "stm32f10x.h"
@@ -75,6 +77,15 @@
  * 实车测试实际停车约 99.7 cm。
  */
 #define STRAIGHT_STOP_OFFSET_DEFAULT   170.0f
+
+/* 半圆弧结束判断默认参数。
+ * arcMinTime：最短运行时间，防止刚起步时误判。
+ * arcYawTarget：半圆弧目标 yaw 变化角度，先用 165°，后续根据停车点微调。
+ * arcMaxTime：安全超时，防止因丢线或 yaw 判断失败而一直跑。
+ */
+#define ARC_MIN_TIME_DEFAULT_MS        1500U
+#define ARC_MAX_TIME_DEFAULT_MS        6000U
+#define ARC_YAW_TARGET_DEFAULT         165.0f
 
 /* ================================================================
  * 2. 八路灰度循迹默认参数
@@ -172,7 +183,9 @@ volatile int32_t g_rightEncoderTotal = 0;
 volatile int32_t g_forwardEncoderTotal = 0;
 volatile int32_t g_turnEncoderTotal = 0;
 
-/* 0 = 普通网页回传，1 = 编码器调试回传，2 = MPU6050 yaw 调试回传，3 = straight 直线测试回传。 */
+/* 0 = 普通网页回传，1 = 编码器调试回传，2 = MPU6050 yaw 调试回传，
+ * 3 = straight 直线测试回传，4 = arcTest 半圆弧测试回传。
+ */
 volatile uint8_t g_plotMode = 0;
 
 volatile float g_speedPwm = 0.0f;
@@ -233,6 +246,20 @@ volatile float g_straightTargetYaw = 0.0f;
 volatile float g_straightYawError = 0.0f;
 volatile float g_yawKp = 1.8f;
 volatile float g_yawKd = 0.15f;
+
+/* arcTest 半圆弧结束判断测试参数。
+ * 从半圆弧起点放车，车头沿弧线切线方向，发送 [key,arcTest,down] 后开始灰度循迹。
+ * 程序记录起始 yaw，并在运行时间超过 arcMinTime 后，
+ * 当 abs(deltaYaw) 超过 arcYawTarget 时自动停车。
+ */
+volatile uint8_t g_arcActive = 0;
+volatile uint8_t g_arcDone = 0;
+volatile uint16_t g_arcRunMs = 0;
+volatile uint16_t g_arcMinTimeMs = ARC_MIN_TIME_DEFAULT_MS;
+volatile uint16_t g_arcMaxTimeMs = ARC_MAX_TIME_DEFAULT_MS;
+volatile float g_arcYawTarget = ARC_YAW_TARGET_DEFAULT;
+volatile float g_arcStartYaw = 0.0f;
+volatile float g_arcDeltaYaw = 0.0f;
 
 /* H 题 task1 最小状态机参数。
  * task1 目标是 A -> B 直线 100 cm，到 B 停车并声光提示。
@@ -828,9 +855,108 @@ static void Straight_Control10ms(void)
     g_lastCmdTickMs = 0;
 }
 
+/* ================================================================
+ * 10. arcTest 半圆弧结束判断测试
+ * ================================================================ */
+
+static void Arc_Finish(void)
+{
+    g_arcActive = 0;
+    g_arcDone = 1;
+    g_workMode = WORK_BT;
+    Control_ForcePWMZero();
+    g_plotMode = 4U;
+    Prompt_Start(700);
+}
+
+static void Arc_Start(void)
+{
+    if (g_safetyLocked)
+    {
+        Prompt_Start(80);
+        return;
+    }
+
+    if (!g_mpuReady)
+    {
+        MPU_AppInit();
+    }
+
+    /* 半圆弧结束判断依赖 yaw。未校准时不启动，先切到 MPU 页面提示。 */
+    if (!g_mpuReady || !g_mpuCalibrated)
+    {
+        g_plotMode = 2U;
+        Control_ForcePWMZero();
+        Prompt_Start(900);
+        return;
+    }
+
+    g_straightActive = 0;
+    g_arcDone = 0;
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+
+    g_workMode = WORK_TRACING;
+    g_plotMode = 4U;
+
+    g_lineLostMs = 0;
+    g_lineErrorFiltered = 0.0f;
+    g_lineLastCtrlError = 0.0f;
+
+    Control_ForcePWMZero();
+    Encoder_DebugClearTotals();
+
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
+    g_arcActive = 1;
+
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
+    Prompt_Start(180);
+}
+
+/* 前向声明：Arc_Control10ms() 位于循迹函数定义之前，先声明避免 ARMCC 隐式声明错误。 */
+static void Tracing_Control10ms(void);
+
+static void Arc_Control10ms(void)
+{
+    float absDelta;
+
+    if (!g_arcActive)
+    {
+        return;
+    }
+
+    if (g_arcRunMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_arcRunMs += CONTROL_PERIOD_MS;
+    }
+
+    g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
+    absDelta = absf_local(g_arcDeltaYaw);
+
+    /* 结束条件：
+     * 1. 至少运行 arcMinTime，避免刚起步误判；
+     * 2. yaw 变化角度达到 arcYawTarget，认为半圆弧结束；
+     * 3. arcMaxTime 是安全超时，防止一直跑。
+     */
+    if (((g_arcRunMs >= g_arcMinTimeMs) && (absDelta >= g_arcYawTarget)) ||
+        (g_arcRunMs >= g_arcMaxTimeMs))
+    {
+        Arc_Finish();
+        return;
+    }
+
+    Tracing_Control10ms();
+    g_lastCmdTickMs = 0;
+}
+
 
 /* ================================================================
- * 10. H 题 task1 最小状态机
+ * 11. H 题 task1 最小状态机
  * ================================================================ */
 
 static void Task_Reset(void)
@@ -838,6 +964,7 @@ static void Task_Reset(void)
     g_taskState = TASK_IDLE;
     g_taskSelected = 0;
     g_taskRunning = 0;
+    g_arcActive = 0;
 }
 
 static void Task_SelectTask1(void)
@@ -897,8 +1024,10 @@ static void Task_StartSelected(void)
 static void Task_Stop(void)
 {
     g_straightActive = 0;
+    g_arcActive = 0;
     g_taskRunning = 0;
     g_taskState = TASK_IDLE;
+    g_workMode = WORK_BT;
     Control_ForcePWMZero();
     Prompt_Start(300);
 }
@@ -912,6 +1041,7 @@ void App_EmergencyStop(void)
     g_safetyLocked = 1;
     g_workMode = WORK_BT;
     g_straightActive = 0;
+    g_arcActive = 0;
     Task_Reset();
     Control_ForcePWMZero();
     Prompt_Start(500);
@@ -922,6 +1052,7 @@ void App_UnlockControl(void)
     g_safetyLocked = 0;
     g_workMode = WORK_BT;
     g_straightActive = 0;
+    g_arcActive = 0;
     Task_Reset();
     g_lastCmdTickMs = 0;
     Control_ForcePWMZero();
@@ -937,6 +1068,7 @@ void App_StartBluetoothMode(void)
 
     g_workMode = WORK_BT;
     g_straightActive = 0;
+    g_arcActive = 0;
     Task_Reset();
     g_lastCmdTickMs = 0;
     Control_ForcePWMZero();
@@ -951,6 +1083,7 @@ void App_StartTracingMode(void)
     }
 
     g_straightActive = 0;
+    g_arcActive = 0;
     Task_Reset();
     g_workMode = WORK_TRACING;
     g_lineLostMs = 0;
@@ -1168,9 +1301,13 @@ static void Main_ApplySliderPacket(const char *name, float value)
         {
             g_plotMode = 2U;
         }
-        else
+        else if (value < 3.5f)
         {
             g_plotMode = 3U;
+        }
+        else
+        {
+            g_plotMode = 4U;
         }
         return;
     }
@@ -1219,6 +1356,26 @@ static void Main_ApplySliderPacket(const char *name, float value)
         g_taskStopOffsetPulse = limit_float(value, 0.0f, 2000.0f);
         return;
     }
+    if (str_is_name(name, "arcMinTime", "arcMin", "arcTime"))
+    {
+        g_arcMinTimeMs = (uint16_t)limit_float(value, 0.0f, 20000.0f);
+        return;
+    }
+    if (str_is_name(name, "arcMaxTime", "arcTimeout", "arcLimitTime"))
+    {
+        g_arcMaxTimeMs = (uint16_t)limit_float(value, 500.0f, 60000.0f);
+        return;
+    }
+    if (str_is_name(name, "arcYawTarget", "arcYaw", "arcAngle"))
+    {
+        g_arcYawTarget = limit_float(value, 30.0f, 180.0f);
+        return;
+    }
+    if (str_is_name(name, "arcSpeed", "arcTraceSpeed", "arcV"))
+    {
+        g_traceBaseSpeed = limit_float(value, 0.0f, 120.0f);
+        return;
+    }
 }
 
 static void Main_ApplyJoystickPacket(char **tok, int n)
@@ -1232,7 +1389,7 @@ static void Main_ApplyJoystickPacket(char **tok, int n)
     {
         return;
     }
-    if (g_safetyLocked || g_straightActive || g_workMode != WORK_BT)
+    if (g_safetyLocked || g_straightActive || g_arcActive || g_workMode != WORK_BT)
     {
         return;
     }
@@ -1343,6 +1500,12 @@ static void Main_ApplyPacket(char *payload)
             {
                 Task_Reset();
                 Straight_Start();
+                return;
+            }
+            if (str_is_name(tok[1], "arcTest", "arc", "arcRun"))
+            {
+                Task_Reset();
+                Arc_Start();
                 return;
             }
             if (str_is_name(tok[1], "plotNormal", "normalPlot", "plot0"))
@@ -1753,6 +1916,10 @@ static void Control_Run10ms(void)
     {
         Straight_Control10ms();
     }
+    else if (g_arcActive)
+    {
+        Arc_Control10ms();
+    }
     else if (g_workMode == WORK_TRACING)
     {
         Tracing_Control10ms();
@@ -1807,6 +1974,10 @@ static char *ModeString(void)
     {
         return "STR";
     }
+    if (g_arcActive)
+    {
+        return "ARC";
+    }
     if (g_workMode == WORK_TRACING)
     {
         return "TRACE";
@@ -1818,7 +1989,7 @@ static void Serial_SendPlotStatus(void)
 {
     int modeCode;
 
-    modeCode = g_safetyLocked ? 9 : (g_straightActive ? 3 : ((g_taskState == TASK_READY_TASK1) ? 11 : ((g_taskState == TASK_FINISH) ? 12 : (int)g_workMode)));
+    modeCode = g_safetyLocked ? 9 : (g_straightActive ? 3 : (g_arcActive ? 4 : ((g_taskState == TASK_READY_TASK1) ? 11 : ((g_taskState == TASK_FINISH) ? 12 : (int)g_workMode))));
 
     if (g_plotMode == 1U)
     {
@@ -1907,6 +2078,35 @@ static void Serial_SendPlotStatus(void)
         return;
     }
 
+    if (g_plotMode == 4U)
+    {
+        /*
+         * arcTest 半圆弧测试回传格式：
+         * CH1  modeCode：4=arcTest 正在执行，9=急停
+         * CH2  yaw * 10
+         * CH3  deltaYaw * 10
+         * CH4  arcRunMs / 10
+         * CH5  lineError
+         * CH6  lineMask
+         * CH7  目标前进速度
+         * CH8  目标转向速度
+         * CH9  当前平均累计脉冲
+         * CH10 lineValid
+         */
+        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%ld,%d]\r\n",
+                      modeCode,
+                      (int)(g_yawDeg * 10.0f),
+                      (int)(g_arcDeltaYaw * 10.0f),
+                      (int)(g_arcRunMs / 10U),
+                      (int)g_lineError,
+                      (int)g_lineMask,
+                      (int)g_targetForwardSpeed,
+                      (int)g_targetTurnSpeed,
+                      (long)g_forwardEncoderTotal,
+                      (int)g_lineValid);
+        return;
+    }
+
     Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
                   modeCode,
                   (int)g_lineError,
@@ -1952,6 +2152,16 @@ static void OLED_ShowStatus(void)
         return;
     }
 
+    if (g_plotMode == 4U)
+    {
+        OLED_Printf(0, 0, OLED_8X16, "ARC R:%04d T:%03d", (int)g_arcRunMs, (int)g_arcYawTarget);
+        OLED_Printf(0, 16, OLED_8X16, "Y:%+04d D:%+04d", (int)g_yawDeg, (int)g_arcDeltaYaw);
+        OLED_Printf(0, 32, OLED_8X16, "E:%+04d M:%02X", (int)g_lineError, (int)g_lineMask);
+        OLED_Printf(0, 48, OLED_8X16, "F:%+03d T:%+03d", (int)g_targetForwardSpeed, (int)g_targetTurnSpeed);
+        OLED_Update();
+        return;
+    }
+
     OLED_Printf(0, 0, OLED_8X16, "M:%s LK:%d RP:%03d", ModeString(), (int)g_safetyLocked, (int)g_btSpeedLimitPercent);
     OLED_Printf(0, 16, OLED_8X16, "T:%+04d V:%+04d", (int)g_targetForwardSpeed, (int)g_forwardSpeed);
     OLED_Printf(0, 32, OLED_8X16, "L:%+04d R:%+04d", (int)g_leftPwm, (int)g_rightPwm);
@@ -1973,6 +2183,7 @@ static void Main_KeyProcess(void)
     {
         ApplySpeedLimitPercent(0.0f);
         g_straightActive = 0;
+        g_arcActive = 0;
         Task_Reset();
         Control_ForcePWMZero();
         Prompt_Start(160);
@@ -1981,7 +2192,7 @@ static void Main_KeyProcess(void)
 
     if (key == 2U)
     {
-        if (g_straightActive || g_taskRunning)
+        if (g_straightActive || g_arcActive || g_taskRunning)
         {
             Task_Stop();
             return;
