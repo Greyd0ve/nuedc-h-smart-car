@@ -27,11 +27,13 @@
  *   TASK2_STRAIGHT_AB     A -> B 直线，平均脉冲到 task2SearchPulse 后提前找线
  *   TASK2_SEARCH_ARC_BC   继续直行，允许丢线，直到检测到 B->C 半圆弧黑线
  *   TASK2_TRACE_ARC_BC    灰度循迹跑 B->C 半圆弧
- *   TASK2_ALIGN_C         C 出弯后补角，直到左右轮脉冲差达到 arcWheelDiff
+ *   TASK2_WAIT_ALIGN_C    C 出弯丢线后立即停车等待 0.5s
+ *   TASK2_ALIGN_C         等待结束后补角，直到左右轮脉冲差达到 arcWheelDiff
  *   TASK2_STRAIGHT_CD     C -> D 直线，平均脉冲到 task2SearchPulse 后提前找线
  *   TASK2_SEARCH_ARC_DA   继续直行，允许丢线，直到检测到 D->A 半圆弧黑线
  *   TASK2_TRACE_ARC_DA    灰度循迹跑 D->A 半圆弧
- *   TASK2_ALIGN_A         A 出弯后补角，到达 arcWheelDiff 后结束 task2
+ *   TASK2_WAIT_ALIGN_A    A 出弯丢线后立即停车等待 0.5s
+ *   TASK2_ALIGN_A         等待结束后补角，到达 arcWheelDiff 后结束 task2
  *   TASK2_FINISH          停车并声光提示
  *
  * 网页命令保留：
@@ -195,10 +197,12 @@ typedef enum
     TASK2_STRAIGHT_AB,
     TASK2_SEARCH_ARC_BC,
     TASK2_TRACE_ARC_BC,
+    TASK2_WAIT_ALIGN_C,
     TASK2_ALIGN_C,
     TASK2_STRAIGHT_CD,
     TASK2_SEARCH_ARC_DA,
     TASK2_TRACE_ARC_DA,
+    TASK2_WAIT_ALIGN_A,
     TASK2_ALIGN_A,
     TASK2_FINISH
 } TaskState_t;
@@ -343,11 +347,19 @@ volatile uint16_t g_task2LineLostMs = 0;
 volatile float g_task2SearchStartPulse = 0.0f;
 volatile float g_task2CurrentTurnSign = -1.0f;
 
+/* task2 出弯后暂停参数：
+ * C/A 点丢线判定出弯后，先立即停车保持 0.5s，
+ * 再进入 ALIGN 补角，避免丢线瞬间速度惯性造成过度转向。
+ */
+volatile uint16_t g_task2AlignWaitMs = 0;
+volatile uint16_t g_task2AlignWaitTargetMs = 500U;
+
 /* ================================================================
  * 6. 前向声明
  * ================================================================ */
 
 static void Line_Update(void);
+static float Line_CalcTurnCmd(void);
 static void Tracing_Control10ms(void);
 static void Task2_SearchArcStart(float turnSign);
 static uint8_t Task2_IsSpecialState(void);
@@ -1160,6 +1172,11 @@ static uint8_t Task2_IsTraceState(void)
     return (g_taskState == TASK2_TRACE_ARC_BC || g_taskState == TASK2_TRACE_ARC_DA);
 }
 
+static uint8_t Task2_IsWaitAlignState(void)
+{
+    return (g_taskState == TASK2_WAIT_ALIGN_C || g_taskState == TASK2_WAIT_ALIGN_A);
+}
+
 static uint8_t Task2_IsAlignState(void)
 {
     return (g_taskState == TASK2_ALIGN_C || g_taskState == TASK2_ALIGN_A);
@@ -1167,7 +1184,8 @@ static uint8_t Task2_IsAlignState(void)
 
 static uint8_t Task2_IsSpecialState(void)
 {
-    return (uint8_t)(Task2_IsSearchState() || Task2_IsTraceState() || Task2_IsAlignState());
+    return (uint8_t)(Task2_IsSearchState() || Task2_IsTraceState() ||
+                     Task2_IsWaitAlignState() || Task2_IsAlignState());
 }
 
 static void Task2_SearchArcStart(float turnSign)
@@ -1180,6 +1198,7 @@ static void Task2_SearchArcStart(float turnSign)
     g_task2CurrentTurnSign = (turnSign < 0.0f) ? -1.0f : 1.0f;
     g_task2LineValidMs = 0;
     g_task2LineLostMs = 0;
+    g_task2AlignWaitMs = 0;
     g_arcRunMs = 0;
     g_arcStartYaw = g_yawDeg;
     g_arcDeltaYaw = 0.0f;
@@ -1219,18 +1238,25 @@ static void Task2_StartTraceArc(void)
 
 static void Task2_FinishTraceArc(void)
 {
+    /*
+     * C/A 点出弯处理：
+     * 一旦半圆弧 TRACE 阶段检测到有效出弯丢线，立即停车，
+     * 先等待 0.5s，再进入 ALIGN 补角。
+     * 这样可以避免出弯瞬间惯性和残余转向导致左右轮差继续过冲。
+     */
     Control_ForcePWMZero();
+    g_task2AlignWaitMs = 0;
 
     if (g_taskState == TASK2_TRACE_ARC_BC)
     {
-        g_taskState = TASK2_ALIGN_C;
+        g_taskState = TASK2_WAIT_ALIGN_C;
         Prompt_Start(180);
         return;
     }
 
     if (g_taskState == TASK2_TRACE_ARC_DA)
     {
-        g_taskState = TASK2_ALIGN_A;
+        g_taskState = TASK2_WAIT_ALIGN_A;
         Prompt_Start(180);
         return;
     }
@@ -1310,6 +1336,63 @@ static void Task2_ControlSearch10ms(void)
     Task2_ApplyYawStraightHold(g_task2SearchSpeed);
 }
 
+static void Task2_TraceLineNoLost10ms(void)
+{
+    float forward;
+    float turn;
+    float e;
+    float slowRatio;
+    float minForward;
+
+    if (g_speedScale <= 0.01f || g_pwmLimit <= 0.5f)
+    {
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 0;
+        return;
+    }
+
+    /*
+     * 本函数只用于 task2 的半圆弧 TRACE 阶段。
+     * 外部已经调用过 Line_Update()。
+     * 如果 lineValid=0，绝不执行普通循迹里的 lostTurn 找线逻辑，
+     * 只停车等待状态机进入 WAIT_ALIGN/ALIGN。
+     */
+    if (!g_lineValid)
+    {
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        return;
+    }
+
+    e = absf_local((float)g_lineError) / 350.0f;
+    if (e > 1.0f)
+    {
+        e = 1.0f;
+    }
+
+    slowRatio = 1.0f - limit_float(g_lineSlowGain, 0.0f, 0.95f) * e;
+
+    if ((g_lineMask & 0xC3U) != 0U)
+    {
+        slowRatio *= limit_float(g_lineEdgeSpeedRatio, 0.05f, 1.0f);
+    }
+
+    forward = g_traceBaseSpeed * g_speedScale * slowRatio;
+    minForward = g_traceSearchSpeed * g_speedScale;
+    if (forward < minForward)
+    {
+        forward = minForward;
+    }
+
+    turn = Line_CalcTurnCmd() * g_speedScale;
+
+    g_targetForwardSpeed = slew_float(g_targetForwardSpeed, forward, g_forwardSlewStep);
+    g_targetTurnSpeed = slew_float(g_targetTurnSpeed, turn, g_turnSlewStep);
+    g_carEnable = 1;
+}
+
 static void Task2_ControlTrace10ms(void)
 {
     float forwardAbs;
@@ -1321,16 +1404,9 @@ static void Task2_ControlTrace10ms(void)
     g_arcDeltaYaw = wrap_180(g_yawDeg - g_arcStartYaw);
 
     /*
-     * 重要修改：半圆弧 TRACE 阶段不能先调用 Tracing_Control10ms()。
-     * 原因：普通循迹函数在丢线时会进入 lostTurn 找线逻辑，
-     * 会在 C/A 出弯后继续大幅转向，导致左右轮差过冲。
-     *
-     * 因此这里先单独读取灰度：
-     *   - 如果仍然在线上：才执行正常灰度循迹；
-     *   - 如果已经满足“弧线最小时间 + 最小平均脉冲”后丢线：
-     *     立即退出 TRACE，进入 ALIGN 补角状态；
-     *   - 如果还没跑够最小弧线长度就丢线：认为可能是中途短暂丢线，
-     *     才允许普通循迹的找线逻辑继续工作。
+     * task2 半圆弧 TRACE 阶段只读取一次灰度。
+     * 在线时使用 task2 专用循迹控制；
+     * 丢线时不允许进入普通 Tracing_Control10ms() 的 lostTurn 找线逻辑。
      */
     Line_Update();
     forwardAbs = absf_local((float)g_forwardEncoderTotal);
@@ -1338,42 +1414,79 @@ static void Task2_ControlTrace10ms(void)
     if (g_lineValid)
     {
         g_task2LineLostMs = 0;
-
-        /* 仍在黑线上，正常执行灰度循迹。
-         * 注意：Tracing_Control10ms() 内部会再次 Line_Update()，
-         * 这里会重复读一次灰度，但逻辑安全，后续如需优化可拆分循迹函数。
-         */
-        Tracing_Control10ms();
+        Task2_TraceLineNoLost10ms();
         g_lastCmdTickMs = 0;
         return;
     }
+
+    /* lineValid=0：先立即停车，避免继续转向。 */
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 1;
+    g_lastCmdTickMs = 0;
 
     if (g_task2LineLostMs < 60000U - CONTROL_PERIOD_MS)
     {
         g_task2LineLostMs += CONTROL_PERIOD_MS;
     }
 
-    /* C/A 出弯：已经跑够半圆弧基本长度后，一旦丢线就不要找线，
-     * 直接进入补角状态。g_task2LineLostConfirmMs 默认为 0，表示立即触发；
-     * 若灰度抖动严重，可以通过 [slider,arcLostMs,10] 加少量确认时间。
+    /*
+     * 已经跑过足够弧线长度后丢线，认为到达 C/A 出弯点：
+     * 立即切入 WAIT_ALIGN，先停车 0.5s，再开始补角。
      */
     if ((g_arcRunMs >= g_arcMinTimeMs) &&
         (forwardAbs >= g_task2ArcMinForwardPulse) &&
         (g_task2LineLostMs >= g_task2LineLostConfirmMs))
     {
-        g_targetForwardSpeed = 0.0f;
-        g_targetTurnSpeed = 0.0f;
-        g_carEnable = 1;
-        g_lastCmdTickMs = 0;
         Task2_FinishTraceArc();
         return;
     }
 
-    /* 还没有跑够半圆弧最小距离时丢线，认为可能是弯道中途瞬时丢线，
-     * 这时才允许普通循迹的 lostTurn 找线逻辑。
-     */
-    Tracing_Control10ms();
+    /* 弧线前半段异常丢线：保持停车，不找线，等待人工观察/急停。 */
+}
+
+static void Task2_ControlWaitAlign10ms(void)
+{
+    /* 出弯后强制停车等待 0.5s。 */
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_carEnable = 0;
+    Motor_StopAll();
+    PID_Reset(&ForwardPID);
+    PID_Reset(&TurnPID);
     g_lastCmdTickMs = 0;
+
+    if (g_task2AlignWaitMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_task2AlignWaitMs += CONTROL_PERIOD_MS;
+    }
+
+    if (g_task2AlignWaitMs < g_task2AlignWaitTargetMs)
+    {
+        return;
+    }
+
+    g_task2AlignWaitMs = 0;
+
+    if (g_taskState == TASK2_WAIT_ALIGN_C)
+    {
+        g_taskState = TASK2_ALIGN_C;
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        Prompt_Start(120);
+        return;
+    }
+
+    if (g_taskState == TASK2_WAIT_ALIGN_A)
+    {
+        g_taskState = TASK2_ALIGN_A;
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        Prompt_Start(120);
+        return;
+    }
 }
 
 static void Task2_ControlAlign10ms(void)
@@ -1414,6 +1527,12 @@ static void Task2_Control10ms(void)
         return;
     }
 
+    if (Task2_IsWaitAlignState())
+    {
+        Task2_ControlWaitAlign10ms();
+        return;
+    }
+
     if (Task2_IsAlignState())
     {
         Task2_ControlAlign10ms();
@@ -1430,6 +1549,7 @@ static void Task_Reset(void)
     g_arcActive = 0;
     g_task2LineValidMs = 0;
     g_task2LineLostMs = 0;
+    g_task2AlignWaitMs = 0;
     g_task2SearchStartPulse = 0.0f;
 }
 
@@ -1851,6 +1971,11 @@ static void Main_ApplySliderPacket(const char *name, float value)
         g_task2LineLostConfirmMs = (uint16_t)limit_float(value, 0.0f, 3000.0f);
         return;
     }
+    if (str_is_name(name, "alignWaitMs", "arcWaitMs", "waitAlign"))
+    {
+        g_task2AlignWaitTargetMs = (uint16_t)limit_float(value, 0.0f, 3000.0f);
+        return;
+    }
     if (str_is_name(name, "toArcSpeed", "arcSearchSpeed", "searchArcSpeed"))
     {
         g_task2SearchSpeed = limit_float(value, 0.0f, 60.0f);
@@ -2096,9 +2221,11 @@ static int ModeCode(void)
     if (g_taskState == TASK_READY_TASK2) return 21;
     if (g_taskState == TASK2_SEARCH_ARC_BC) return 31;
     if (g_taskState == TASK2_TRACE_ARC_BC) return 32;
+    if (g_taskState == TASK2_WAIT_ALIGN_C) return 37;
     if (g_taskState == TASK2_ALIGN_C) return 33;
     if (g_taskState == TASK2_SEARCH_ARC_DA) return 34;
     if (g_taskState == TASK2_TRACE_ARC_DA) return 35;
+    if (g_taskState == TASK2_WAIT_ALIGN_A) return 38;
     if (g_taskState == TASK2_ALIGN_A) return 36;
     if (g_taskState == TASK2_FINISH) return 22;
     if (g_taskState == TASK_FINISH) return 12;
