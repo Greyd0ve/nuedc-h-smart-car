@@ -258,6 +258,15 @@ volatile float g_mpuYawSign = 1.0f;
 volatile float g_gyroZRawDps = 0.0f;
 volatile float g_gyroZBiasDps = 0.0f;
 volatile float g_gyroZDps = 0.0f;
+volatile float g_gyroZScale = 1.0f;
+volatile uint8_t g_gyroZKalmanEnable = 1U;
+volatile float g_gyroZKalmanQ = 0.02f;
+volatile float g_gyroZKalmanR = 1.5f;
+volatile float g_gyroZKalmanP = 1.0f;
+volatile float g_gyroZKalmanX = 0.0f;
+volatile uint8_t g_staticBiasTrackEnable = 1U;
+volatile float g_staticBiasAlpha = 0.999f;
+volatile float g_gyroZDeadbandDps = 0.03f;
 volatile float g_yawDeg = 0.0f;
 volatile float g_yawTotalDeg = 0.0f;
 
@@ -648,6 +657,39 @@ static void MPU_ResetYaw(void)
     g_yawTotalDeg = 0.0f;
 }
 
+static float Kalman1D_GyroZUpdate(float z)
+{
+    float k;
+
+    if (g_gyroZKalmanQ < 0.0f) g_gyroZKalmanQ = 0.0f;
+    if (g_gyroZKalmanR < 0.0001f) g_gyroZKalmanR = 0.0001f;
+    if (g_gyroZKalmanP < 0.0001f) g_gyroZKalmanP = 0.0001f;
+
+    g_gyroZKalmanP += g_gyroZKalmanQ;
+    if (g_gyroZKalmanP < 0.0001f) g_gyroZKalmanP = 0.0001f;
+
+    k = g_gyroZKalmanP / (g_gyroZKalmanP + g_gyroZKalmanR);
+    g_gyroZKalmanX = g_gyroZKalmanX + k * (z - g_gyroZKalmanX);
+    g_gyroZKalmanP = (1.0f - k) * g_gyroZKalmanP;
+
+    return g_gyroZKalmanX;
+}
+
+static uint8_t MPU_IsCarStaticForBiasUpdate(void)
+{
+    if (g_taskRunning) return 0U;
+    if (g_straightActive) return 0U;
+    if (g_arcActive) return 0U;
+    if (TaskAuto_IsSpecialState()) return 0U;
+
+    if (absf_local(g_targetForwardSpeed) > 0.5f) return 0U;
+    if (absf_local(g_targetTurnSpeed) > 0.5f) return 0U;
+    if (absf_local(g_forwardSpeed) > 0.5f) return 0U;
+    if (absf_local(g_turnSpeed) > 0.5f) return 0U;
+
+    return 1U;
+}
+
 
 
 static void MPU_AppInit(void)
@@ -666,6 +708,8 @@ static void MPU_AppInit(void)
         g_gyroZRawDps = 0.0f;
         g_gyroZBiasDps = 0.0f;
         g_gyroZDps = 0.0f;
+        g_gyroZKalmanX = 0.0f;
+        g_gyroZKalmanP = 1.0f;
         MPU_ResetYaw();
     }
     else
@@ -691,6 +735,8 @@ static void MPU_ManualYawZero(void)
     g_gyroZDps = 0.0f;
     g_yawDeg = 0.0f;
     g_yawTotalDeg = 0.0f;
+    g_gyroZKalmanX = g_gyroZRawDps;
+    g_gyroZKalmanP = 1.0f;
 
     /* 手动确认：认为当前 yaw 已经可用于直线航向保持 */
     g_mpuCalibrated = 1;
@@ -703,6 +749,9 @@ static void MPU_UpdateYaw(uint16_t elapsedMs)
 {
     MPU6050_Data_t data;
     float dt;
+    float gyroRaw;
+    float gyroFiltered;
+    float gyroCorrected;
 
     if (!g_mpuReady || g_mpuCalibrating) return;
     if (elapsedMs == 0U) return;
@@ -716,8 +765,36 @@ static void MPU_UpdateYaw(uint16_t elapsedMs)
     }
 
     dt = (float)elapsedMs * 0.001f;
-    g_gyroZRawDps = data.GyroZ_dps;
-    g_gyroZDps = (data.GyroZ_dps - g_gyroZBiasDps) * g_mpuYawSign;
+    gyroRaw = data.GyroZ_dps;
+    g_gyroZRawDps = gyroRaw;
+
+    if (g_gyroZKalmanEnable)
+    {
+        gyroFiltered = Kalman1D_GyroZUpdate(gyroRaw);
+    }
+    else
+    {
+        gyroFiltered = gyroRaw;
+    }
+
+    if (g_staticBiasTrackEnable && MPU_IsCarStaticForBiasUpdate())
+    {
+        g_gyroZBiasDps =
+            g_staticBiasAlpha * g_gyroZBiasDps +
+            (1.0f - g_staticBiasAlpha) * gyroFiltered;
+    }
+
+    gyroCorrected =
+        (gyroFiltered - g_gyroZBiasDps) *
+        g_gyroZScale *
+        g_mpuYawSign;
+
+    if (absf_local(gyroCorrected) < g_gyroZDeadbandDps)
+    {
+        gyroCorrected = 0.0f;
+    }
+
+    g_gyroZDps = gyroCorrected;
 
     g_yawTotalDeg += g_gyroZDps * dt;
     g_yawDeg = wrap_180(g_yawDeg + g_gyroZDps * dt);
@@ -763,6 +840,8 @@ static void MPU_CalibrateGyroZ(void)
         g_gyroZBiasDps = sum / (float)okCount;
         g_gyroZRawDps = g_gyroZBiasDps;
         g_gyroZDps = 0.0f;
+        g_gyroZKalmanX = g_gyroZBiasDps;
+        g_gyroZKalmanP = 1.0f;
         MPU_ResetYaw();
         g_mpuCalibrated = 1;
         g_mpuErr = MPU6050_OK;
@@ -2511,6 +2590,8 @@ static void Main_KeyProcess(void)
 
 int main(void)
 {
+    uint8_t mpuUpdateCount;
+
     OLED_Init();
     Key_Init();
     Grayscale_Init();
@@ -2539,11 +2620,12 @@ int main(void)
         App_Protocol_Process();
         Main_KeyProcess();
 
-        if (g_mpuUpdateMs >= MPU_UPDATE_PERIOD_MS)
+        mpuUpdateCount = 0U;
+        while (g_mpuUpdateMs >= MPU_UPDATE_PERIOD_MS && mpuUpdateCount < 2U)
         {
-            uint16_t elapsedMs = g_mpuUpdateMs;
-            g_mpuUpdateMs = 0;
-            MPU_UpdateYaw(elapsedMs);
+            g_mpuUpdateMs -= MPU_UPDATE_PERIOD_MS;
+            MPU_UpdateYaw(MPU_UPDATE_PERIOD_MS);
+            mpuUpdateCount++;
         }
 
         if (g_plotReportMs >= PLOT_REPORT_PERIOD_MS)

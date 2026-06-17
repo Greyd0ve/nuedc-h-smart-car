@@ -78,6 +78,16 @@ extern volatile uint32_t g_protoErrTooLongCount;
 extern volatile uint32_t g_protoErrLockedCount;
 
 extern volatile float g_mpuYawSign;
+extern volatile float g_gyroZRawDps;
+extern volatile float g_gyroZScale;
+extern volatile uint8_t g_gyroZKalmanEnable;
+extern volatile float g_gyroZKalmanQ;
+extern volatile float g_gyroZKalmanR;
+extern volatile float g_gyroZKalmanP;
+extern volatile float g_gyroZKalmanX;
+extern volatile uint8_t g_staticBiasTrackEnable;
+extern volatile float g_staticBiasAlpha;
+extern volatile float g_gyroZDeadbandDps;
 extern volatile float g_yawKp;
 extern volatile float g_yawKd;
 extern volatile float g_straightSpeed;
@@ -386,6 +396,7 @@ static uint8_t App_Protocol_WebPidStartControl(void)
 static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
 {
     float ratio;
+    uint8_t enable;
 
     if (App_Protocol_IsName(name, "RP", "rp", "speedLimit"))
     {
@@ -441,6 +452,29 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     if (App_Protocol_IsName(name, "lineReverse", "reverseLine", "sensorReverse")) { if (value < 0.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; } g_lineReverseOrderF = (value <= 0.0f) ? 0.0f : 1.0f; return App_Protocol_ResultOk(1U); }
 
     if (App_Protocol_IsName(name, "yawSign", "gyroSign", "mpuSign")) { if (value < -1.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; } g_mpuYawSign = (value < 0.0f) ? -1.0f : 1.0f; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "gyroZScale", "gyroScale", "gyroZGain")) { if (!App_Protocol_SetFloatRange(&g_gyroZScale, value, 0.80f, 1.20f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "gyroZKalmanEnable", "gyroKalmanEnable", "kalmanGyroZ"))
+    {
+        if (value < 0.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        enable = (value < 0.5f) ? 0U : 1U;
+        if (enable && !g_gyroZKalmanEnable)
+        {
+            g_gyroZKalmanX = g_gyroZRawDps;
+            g_gyroZKalmanP = 1.0f;
+        }
+        g_gyroZKalmanEnable = enable;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "gyroZKalmanQ", "gyroKalmanQ", "kalmanQ")) { if (!App_Protocol_SetFloatRange(&g_gyroZKalmanQ, value, 0.001f, 0.2f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "gyroZKalmanR", "gyroKalmanR", "kalmanR")) { if (!App_Protocol_SetFloatRange(&g_gyroZKalmanR, value, 0.1f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "staticBiasTrack", "staticBiasTrackEnable", "biasTrack"))
+    {
+        if (value < 0.0f || value > 1.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        g_staticBiasTrackEnable = (value < 0.5f) ? 0U : 1U;
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "staticBiasAlpha", "biasAlpha", "gyroBiasAlpha")) { if (!App_Protocol_SetFloatRange(&g_staticBiasAlpha, value, 0.990f, 0.9999f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "gyroZDeadband", "gyroZDeadbandDps", "gyroDeadband")) { if (!App_Protocol_SetFloatRange(&g_gyroZDeadbandDps, value, 0.0f, 1.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "yawKp", "headingKp", "straightKp")) { if (!App_Protocol_SetFloatRange(&g_yawKp, value, 0.0f, 20.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "yawKd", "headingKd", "straightKd")) { if (!App_Protocol_SetFloatRange(&g_yawKd, value, 0.0f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "straightSpeed", "straightV", "lineV")) { if (!App_Protocol_SetFloatRange(&g_straightSpeed, value, 0.0f, 80.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
