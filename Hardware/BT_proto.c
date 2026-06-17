@@ -3,14 +3,14 @@
  * 作用：解析蓝牙串口小程序发送的数据包。
  *
  * 支持的数据包来自蓝牙串口协议：
- *   [joystick,lx,ly,rx,ry] 或短格式 [j,lx,ly,rx,ry]
+ *   [joystick,lx,ly,rx,ry] 或短格式 [j,lx,ly,rx,ry]  已禁用运动输出
  *   [slider,id,value]      或短格式 [s,id,value]
  *   [slider,RP,0~100]     使用名为 RP 的滑杆控制最高 PWM 输出百分比
  *   [key,id,down/up]       或短格式 [k,id,d/u]
  *   [key,tracing,down]     进入八路灰度循迹模式
- *   [key,Bluetooth,down]   进入蓝牙遥控模式
+ *   [key,Bluetooth,down]   已禁用：不进入蓝牙遥控模式
  *   [key,emergency,down]   立即急停并进入安全锁定状态
- *   [key,unlock,down]      解除安全锁，回到蓝牙遥控空闲状态
+ *   [key,unlock,down]      解除安全锁，回到待机状态
  *
  * 本版修改重点：
  *   原先最高速度由板载 RP4 电位器控制；现在改为由蓝牙滑杆 RP 控制。
@@ -24,9 +24,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-extern volatile float g_targetForwardSpeed;
-extern volatile float g_targetTurnSpeed;
-extern volatile uint8_t g_carEnable;
 extern volatile uint32_t g_lastCmdTickMs;
 
 extern volatile float g_forwardKp;
@@ -51,7 +48,6 @@ extern volatile uint32_t g_protoErrRangeCount;
 extern volatile uint32_t g_protoErrTooLongCount;
 
 extern void App_StartTracingMode(void);
-extern void App_StartBluetoothMode(void);
 extern void App_EmergencyStop(void);
 extern void App_UnlockControl(void);
 
@@ -114,12 +110,29 @@ static int str_is_bluetooth_name(const char *s)
 
 static int str_is_emergency_name(const char *s)
 {
-    return str_equal_ignore_case(s, "emergency") || str_equal_ignore_case(s, "emg") || str_equal_ignore_case(s, "stop");
+    return str_equal_ignore_case(s, "emergency") || str_equal_ignore_case(s, "emg");
 }
 
 static int str_is_unlock_name(const char *s)
 {
     return str_equal_ignore_case(s, "unlock") || str_equal_ignore_case(s, "release") || str_equal_ignore_case(s, "resume");
+}
+
+static int str_is_remote_motion_key(const char *s)
+{
+    return str_equal_ignore_case(s, "up") ||
+           str_equal_ignore_case(s, "down") ||
+           str_equal_ignore_case(s, "left") ||
+           str_equal_ignore_case(s, "right") ||
+           str_equal_ignore_case(s, "forward") ||
+           str_equal_ignore_case(s, "fwd") ||
+           str_equal_ignore_case(s, "backward") ||
+           str_equal_ignore_case(s, "back") ||
+           str_equal_ignore_case(s, "stop") ||
+           str_equal_ignore_case(s, "halt") ||
+           str_equal_ignore_case(s, "brake") ||
+           str_equal_ignore_case(s, "speedUp") ||
+           str_equal_ignore_case(s, "speedDown");
 }
 
 static int str_is_rp_name(const char *s)
@@ -174,27 +187,13 @@ static uint8_t BT_ResultOk(uint8_t report)
     return BT_PROTO_RESULT_OK;
 }
 
-static uint8_t BT_ParseFloat(const char *text, float *out)
+static uint8_t BT_ResultIgnored(const char *reason, uint8_t report)
 {
-    const char *p;
-    char *endPtr;
-    double value;
-
-    if (text == 0 || out == 0) return 0;
-
-    p = bt_proto_skip_space(text);
-    if (*p == '\0') return 0;
-
-    value = strtod(p, &endPtr);
-    if (endPtr == p) return 0;
-
-    endPtr = (char *)bt_proto_skip_space(endPtr);
-    if (*endPtr != '\0') return 0;
-    if (value != value) return 0;
-    if (value > 1.0e30 || value < -1.0e30) return 0;
-
-    *out = (float)value;
-    return 1;
+    if (report)
+    {
+        Serial_Printf("[status,ignored,%s]\r\n", reason);
+    }
+    return BT_PROTO_RESULT_IGNORED;
 }
 
 static uint8_t BT_ParseInt(const char *text, int *out)
@@ -239,26 +238,6 @@ static uint8_t BT_ReadIntRange(const char *text, int minVal, int maxVal, int *ou
     return 1;
 }
 
-static uint8_t BT_ReadFloatRange(const char *text, float minVal, float maxVal, float *out)
-{
-    float value;
-
-    if (!BT_ParseFloat(text, &value))
-    {
-        BT_RecordError(BT_PROTO_ERR_BAD_FLOAT, "bad-number", 1U);
-        return 0;
-    }
-
-    if (value < minVal || value > maxVal)
-    {
-        BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
-        return 0;
-    }
-
-    *out = value;
-    return 1;
-}
-
 /*
  * 通过蓝牙串口虚拟滑杆 RP 设置最高速度/PWM 限幅。
  * 协议示例：
@@ -278,15 +257,6 @@ static void BT_ApplySpeedLimitPercent(int value)
 
     g_maxForwardCmd = 80.0f * g_speedScale;
     g_maxTurnCmd = 85.0f * g_speedScale;
-}
-
-static float slider_to_command(int value, float maxAbs)
-{
-    if (abs(value) <= 100)
-    {
-        return value * maxAbs / 100.0f;
-    }
-    return (float)value;
 }
 
 static uint8_t apply_packet(char *payload)
@@ -343,42 +313,16 @@ static uint8_t apply_packet(char *payload)
     }
 
     /*
-     * 2. 摇杆控制。
+     * 2. 摇杆包。
      *
      * 协议：
      *   [joystick,左X,左Y,右X,右Y]
      *
-     * 本车目前使用左摇杆 Y 作为前进/后退，右摇杆 X 作为转向。
-     * 也就是说：tok[2] -> forward，tok[3] -> turn。
+     * 蓝牙遥控运动已禁用；收到后只回 ignored，不写目标速度。
      */
     if (str_equal(tok[0], "j") || str_equal(tok[0], "joystick"))
     {
-        if (n >= 4)
-        {
-            int forward;
-            int turn;
-
-            if (g_safetyLocked)
-            {
-                return BT_PROTO_RESULT_IGNORED;
-            }
-
-            if (!BT_ReadIntRange(tok[2], -100, 100, &forward)) return BT_PROTO_RESULT_ERROR;
-            if (!BT_ReadIntRange(tok[3], -100, 100, &turn)) return BT_PROTO_RESULT_ERROR;
-
-            g_targetForwardSpeed = clip_float(forward * g_maxForwardCmd / 100.0f,
-                                              -g_maxForwardCmd,
-                                              g_maxForwardCmd);
-
-            g_targetTurnSpeed = clip_float(-turn * g_maxTurnCmd / 100.0f,
-                                           -g_maxTurnCmd,
-                                           g_maxTurnCmd);
-
-            g_carEnable = 1;
-            return BT_ResultOk(0U);
-        }
-        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
-        return BT_PROTO_RESULT_ERROR;
+        return BT_ResultIgnored("joystick_remote_disabled", 1U);
     }
 
     /*
@@ -397,7 +341,6 @@ static uint8_t apply_packet(char *payload)
         {
             int value;
             int id;
-            float cmd;
 
             if (str_is_rp_name(tok[1]))
             {
@@ -416,25 +359,11 @@ static uint8_t apply_packet(char *payload)
 
             if (id == 1)
             {
-                cmd = slider_to_command(value, g_maxForwardCmd);
-                if (cmd < -g_maxForwardCmd || cmd > g_maxForwardCmd)
-                {
-                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
-                    return BT_PROTO_RESULT_ERROR;
-                }
-                g_targetForwardSpeed = cmd;
-                g_carEnable = 1;
+                return BT_ResultIgnored("slider_forward_remote_disabled", 1U);
             }
             else if (id == 2)
             {
-                cmd = slider_to_command(value, g_maxTurnCmd);
-                if (cmd < -g_maxTurnCmd || cmd > g_maxTurnCmd)
-                {
-                    BT_RecordError(BT_PROTO_ERR_RANGE, "range", 1U);
-                    return BT_PROTO_RESULT_ERROR;
-                }
-                g_targetTurnSpeed = cmd;
-                g_carEnable = 1;
+                return BT_ResultIgnored("slider_turn_remote_disabled", 1U);
             }
             else if (id == 3)
             {
@@ -502,33 +431,14 @@ static uint8_t apply_packet(char *payload)
     /*
      * 4. 直接速度命令。
      *
-     * 这类命令便于串口助手或脚本调试：
+     * 蓝牙直接速度调试已禁用：
      *   [car,forward,turn]
      *   [vel,forward,turn]
      *   [cmd,forward,turn]
      */
     if (str_equal(tok[0], "car") || str_equal(tok[0], "vel") || str_equal(tok[0], "cmd"))
     {
-        if (g_safetyLocked)
-        {
-            return BT_PROTO_RESULT_IGNORED;
-        }
-
-        if (n >= 3)
-        {
-            float forward;
-            float turn;
-
-            if (!BT_ReadFloatRange(tok[1], -g_maxForwardCmd, g_maxForwardCmd, &forward)) return BT_PROTO_RESULT_ERROR;
-            if (!BT_ReadFloatRange(tok[2], -g_maxTurnCmd, g_maxTurnCmd, &turn)) return BT_PROTO_RESULT_ERROR;
-
-            g_targetForwardSpeed = forward;
-            g_targetTurnSpeed = turn;
-            g_carEnable = 1;
-            return BT_ResultOk(1U);
-        }
-        BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
-        return BT_PROTO_RESULT_ERROR;
+        return BT_ResultIgnored("direct_speed_remote_disabled", 1U);
     }
 
     /*
@@ -536,10 +446,9 @@ static uint8_t apply_packet(char *payload)
      *
      * 名称按键：
      *   [key,tracing,down]   -> 八路灰度循迹模式
-     *   [key,Bluetooth,down] -> 蓝牙遥控模式
+     *   [key,Bluetooth,down] -> 已禁用，不进入遥控模式
      *
-     * 数字按键兼容旧代码：
-     *   key 1 停止输出，key 2 使能，key 3 清速度，key 4 停止并失能。
+     * 数字按键兼容旧代码，但运动输出已禁用。
      */
     if (str_equal(tok[0], "k") || str_equal(tok[0], "key"))
     {
@@ -566,34 +475,17 @@ static uint8_t apply_packet(char *payload)
 
             if (isDown && str_is_bluetooth_name(tok[1]))
             {
-                App_StartBluetoothMode();
-                return BT_ResultOk(1U);
+                return BT_ResultIgnored("bluetooth_remote_disabled", 1U);
+            }
+
+            if (isDown && str_is_remote_motion_key(tok[1]))
+            {
+                return BT_ResultIgnored("remote_motion_key_disabled", 1U);
             }
 
             if (!BT_ReadIntRange(tok[1], 1, 4, &id)) return BT_PROTO_RESULT_ERROR;
-
-            if (id == 1 && isDown)
-            {
-                g_carEnable = 0;
-                g_targetForwardSpeed = 0.0f;
-                g_targetTurnSpeed = 0.0f;
-            }
-            else if (id == 2 && isDown)
-            {
-                g_carEnable = 1;
-            }
-            else if (id == 3 && isDown)
-            {
-                g_targetForwardSpeed = 0.0f;
-                g_targetTurnSpeed = 0.0f;
-            }
-            else if (id == 4 && isDown)
-            {
-                g_targetForwardSpeed = 0.0f;
-                g_targetTurnSpeed = 0.0f;
-                g_carEnable = 0;
-            }
-            return BT_ResultOk(1U);
+            (void)id;
+            return BT_ResultIgnored("numeric_remote_key_disabled", 1U);
         }
         BT_RecordError(BT_PROTO_ERR_FIELD, "field", 1U);
         return BT_PROTO_RESULT_ERROR;

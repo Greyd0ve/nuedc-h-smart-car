@@ -41,14 +41,12 @@ void App_UnlockControl(void)
 
 void App_StartBluetoothMode(void)
 {
-    if (g_safetyLocked) return;
-
-    g_workMode = WORK_BT;
-    g_localMode = LOCAL_STANDBY;
-    App_StateTaskReset();
-    g_lastCmdTickMs = 0;
-    App_StateForcePWMZero();
-    App_StatePromptStart(160);
+    /*
+     * Bluetooth serial is kept for parameters, task commands, calibration and
+     * telemetry only. Remote driving mode is intentionally disabled.
+     */
+    (void)g_safetyLocked;
+    App_StatePromptStart(80);
 }
 
 void App_StartTracingMode(void)

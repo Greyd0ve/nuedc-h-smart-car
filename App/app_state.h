@@ -17,6 +17,7 @@ typedef enum
 
 void App_EmergencyStop(void);
 void App_UnlockControl(void);
+/* Compatibility shell only; Bluetooth remote driving is disabled. */
 void App_StartBluetoothMode(void);
 void App_StartTracingMode(void);
 

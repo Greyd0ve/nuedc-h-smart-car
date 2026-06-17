@@ -9,7 +9,8 @@
  *   1. 修正实体按键真实 PCB 映射：K1=PB10，K2=PB11，K3=PA11，K4=PA12。
  *      Key.c 需要同步修改，否则 main.c 的按键含义会错位。
  *   2. 上电默认进入本地待机状态，不再自动进入蓝牙遥控模式；PWM 清零，小车不运动。
- *   3. 蓝牙遥控模式保留，但只允许通过网页命令 [key,Bluetooth,down] 进入。
+ *   3. 蓝牙串口仅用于参数调试、任务控制、MPU 校准和数据回传；
+ *      不再支持蓝牙 joystick / 方向键遥控小车运动。
  *   4. 实体按键作为本地操作面板：
  *      K1：待机 -> 编码器调试 -> MPU 调试 -> 待机 循环切换。
  *      K2：task1 -> task2 -> task3 -> task4 循环选择任务，只选择不启动。
@@ -37,7 +38,7 @@
  *   TASK2_FINISH          停车并声光提示
  *
  * 网页命令保留：
- *   [key,Bluetooth,down]   进入蓝牙遥控模式
+ *   [key,Bluetooth,down]   已禁用：不进入遥控模式
  *   [key,tracing,down]     进入普通循迹模式
  *   [key,emergency,down]   急停锁定
  *   [key,unlock,down]      解除急停

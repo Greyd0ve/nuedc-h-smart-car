@@ -80,9 +80,6 @@ extern volatile uint32_t g_protoErrLockedCount;
 extern volatile float g_mpuYawSign;
 extern volatile float g_yawKp;
 extern volatile float g_yawKd;
-extern volatile uint8_t g_straightActive;
-extern volatile uint8_t g_arcActive;
-extern volatile uint8_t g_taskRunning;
 extern volatile float g_straightSpeed;
 
 extern volatile float g_task2StraightToSearchPulse;
@@ -207,6 +204,15 @@ static uint8_t App_Protocol_ResultNoTick(void)
     return PROTO_RESULT_NO_TICK;
 }
 
+static uint8_t App_Protocol_ResultIgnored(const char *reason, uint8_t report)
+{
+    if (report)
+    {
+        Serial_Printf("[status,ignored,%s]\r\n", reason);
+    }
+    return PROTO_RESULT_IGNORED;
+}
+
 static uint8_t App_Protocol_ParseFloat(const char *text, float *out)
 {
     const char *p;
@@ -227,48 +233,6 @@ static uint8_t App_Protocol_ParseFloat(const char *text, float *out)
     if (value > 1.0e30 || value < -1.0e30) return 0;
 
     *out = (float)value;
-    return 1;
-}
-
-static uint8_t App_Protocol_ParseInt(const char *text, int *out)
-{
-    const char *p;
-    char *endPtr;
-    long value;
-
-    if (text == 0 || out == 0) return 0;
-
-    p = App_Protocol_SkipSpace(text);
-    if (*p == '\0') return 0;
-
-    value = strtol(p, &endPtr, 10);
-    if (endPtr == p) return 0;
-
-    endPtr = (char *)App_Protocol_SkipSpace(endPtr);
-    if (*endPtr != '\0') return 0;
-    if (value > 32767L || value < -32768L) return 0;
-
-    *out = (int)value;
-    return 1;
-}
-
-static uint8_t App_Protocol_ReadIntRange(const char *text, int minVal, int maxVal, int *out)
-{
-    int value;
-
-    if (!App_Protocol_ParseInt(text, &value))
-    {
-        App_Protocol_RecordError(PROTO_ERR_BAD_INT, "bad-number", 1U);
-        return 0;
-    }
-
-    if (value < minVal || value > maxVal)
-    {
-        App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U);
-        return 0;
-    }
-
-    *out = value;
     return 1;
 }
 
@@ -617,32 +581,9 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
 
 static uint8_t App_Protocol_ApplyJoystickPacket(char **tok, int n)
 {
-    int turnRaw;
-    int forwardRaw;
-    float maxForward;
-    float maxTurn;
-
-    if (n < 3)
-    {
-        App_Protocol_RecordError(PROTO_ERR_FIELD, "field", 1U);
-        return PROTO_RESULT_ERROR;
-    }
-    if (g_safetyLocked || g_straightActive || g_arcActive || g_taskRunning ||
-        App_ProtocolTask2IsSpecialState() || g_workMode != WORK_BT)
-    {
-        return PROTO_RESULT_IGNORED;
-    }
-
-    if (!App_Protocol_ReadIntRange(tok[1], -100, 100, &turnRaw)) return PROTO_RESULT_ERROR;
-    if (!App_Protocol_ReadIntRange(tok[2], -100, 100, &forwardRaw)) return PROTO_RESULT_ERROR;
-
-    maxForward = g_maxForwardCmd * g_speedScale;
-    maxTurn = g_maxTurnCmd * g_speedScale;
-
-    g_targetForwardSpeed = App_Protocol_LimitFloat((float)forwardRaw * maxForward / 100.0f, -maxForward, maxForward);
-    g_targetTurnSpeed = App_Protocol_LimitFloat((float)(-turnRaw) * maxTurn / 100.0f, -maxTurn, maxTurn);
-    g_carEnable = 1;
-    return App_Protocol_ResultOk(0U);
+    (void)tok;
+    (void)n;
+    return App_Protocol_ResultIgnored("joystick_remote_disabled", 1U);
 }
 
 static uint8_t App_Protocol_WebPidApplySet(const char *name, float value)
@@ -777,11 +718,19 @@ static uint8_t App_Protocol_ApplyPacket(char *payload)
         if (App_Protocol_IsName(tok[1], "task3", "selectTask3", "t3")) { App_ProtocolSelectOnly(3U); App_ProtocolPromptStart(330); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "task4", "selectTask4", "t4")) { App_ProtocolSelectOnly(4U); App_ProtocolPromptStart(400); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "start", "run", "taskStart")) { App_ProtocolStartSelectedTask(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "stop", "halt", "webStop")) { App_Protocol_WebPidStopControl(); return App_Protocol_ResultOk(1U); }
+        if (App_Protocol_IsName(tok[1], "stop", "halt", "brake")) { return App_Protocol_ResultIgnored("remote_motion_key_disabled", 1U); }
+        if (App_Protocol_IsName(tok[1], "webStop", "pidStop", 0)) { App_Protocol_WebPidStopControl(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "taskStop", "taskReset", "taskIdle")) { App_ProtocolTaskStop(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "arcTest", "arc", "arcRun")) { App_ProtocolTaskReset(); App_ProtocolArcStart(); return App_Protocol_ResultOk(1U); }
         if (App_Protocol_IsName(tok[1], "tracing", "trace", "line")) { App_StartTracingMode(); return App_Protocol_ResultOk(1U); }
-        if (App_Protocol_IsName(tok[1], "Bluetooth", "BT", "remote")) { App_StartBluetoothMode(); return App_Protocol_ResultOk(1U); }
+        if (App_Protocol_IsName(tok[1], "Bluetooth", "BT", "remote")) { return App_Protocol_ResultIgnored("bluetooth_remote_disabled", 1U); }
+        if (App_Protocol_IsName(tok[1], "up", "forward", "fwd") ||
+            App_Protocol_IsName(tok[1], "down", "backward", "back") ||
+            App_Protocol_IsName(tok[1], "left", "right", 0) ||
+            App_Protocol_IsName(tok[1], "speedUp", "speedDown", 0))
+        {
+            return App_Protocol_ResultIgnored("remote_motion_key_disabled", 1U);
+        }
 
         App_Protocol_RecordError(PROTO_ERR_UNKNOWN, "unknown", 1U);
         return PROTO_RESULT_ERROR;
