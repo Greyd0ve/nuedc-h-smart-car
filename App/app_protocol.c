@@ -144,6 +144,7 @@ extern volatile float g_task3CAlignYaw;
 extern volatile float g_task3CAlignBias;
 extern volatile float g_task3BdYawDeg;
 extern volatile uint8_t g_task4LapTarget;
+extern volatile uint16_t g_task4LapYawZeroWaitMs;
 
 extern volatile float g_task1MinLinePulse;
 extern volatile uint8_t g_task1UseLineStop;
@@ -580,6 +581,12 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     {
         if (value < 1.0f || value > 10.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
         g_task4LapTarget = (uint8_t)(value + 0.5f);
+        return App_Protocol_ResultOk(1U);
+    }
+    if (App_Protocol_IsName(name, "task4LapYawZeroWaitMs", "task4YawZeroWait", "task4LapWaitMs") ||
+        App_Protocol_StrEqualIgnoreCase(name, "nextLapWaitMs"))
+    {
+        if (!App_Protocol_SetUint16Range(&g_task4LapYawZeroWaitMs, value, 0.0f, 2000.0f)) return PROTO_RESULT_ERROR;
         return App_Protocol_ResultOk(1U);
     }
 

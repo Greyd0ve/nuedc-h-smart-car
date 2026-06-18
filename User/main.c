@@ -5,18 +5,6 @@
  * 适用硬件：
  *   STM32F103C8T6 小车训练板，标准外设库风格代码。
  *
- * 本版改动重点：
- *   1. 修正实体按键真实 PCB 映射：K1=PB10，K2=PB11，K3=PA11，K4=PA12。
- *      Key.c 需要同步修改，否则 main.c 的按键含义会错位。
- *   2. 上电默认进入本地待机状态，不再自动进入蓝牙遥控模式；PWM 清零，小车不运动。
- *   3. 蓝牙串口仅用于参数调试、任务控制、MPU 校准和数据回传；
- *      不再支持蓝牙 joystick / 方向键遥控小车运动。
- *   4. 实体按键作为本地操作面板：
- *      K1：待机 -> MPU 调试 -> 待机 循环切换。
- *      K2：task1 -> task2 -> task3 -> task4 循环选择任务，只选择不启动。
- *      K3：待机状态执行当前任务；MPU 调试清零 yaw。
- *      K4：等待命令阶段进入 MPU 调试并一键校准，staticBiasTrack 默认保持开启；
- *          非等待阶段解除急停/锁定，PWM 清零，回到待机。
  *
  * task2 当前策略：
  *   A->B / C->D：MPU yaw 航向保持 + 编码器距离判断。
@@ -46,33 +34,6 @@
  *   TASK2_WAIT_ALIGN_A    A 出弯丢线后立即停车等待 0.5s
  *   TASK2_ALIGN_A         等待结束后用 MPU yaw 补角到 A 点终止方向
  *   TASK2_FINISH          停车并声光提示
- *
- * 网页命令保留：
- *   [key,Bluetooth,down]   已禁用：不进入遥控模式
- *   [key,tracing,down]     进入普通循迹模式
- *   [key,emergency,down]   急停锁定
- *   [key,unlock,down]      解除急停
- *   [key,presetFast,down]  恢复默认高速循迹参数
- *   [key,encDebug,down]    已移除：编码器调试入口被忽略
- *   [key,mpuDebug,down]    MPU 调试回传
- *   [key,mpuCalib,down]    GyroZ 零偏校准
- *   [key,yawZero,down]     yaw 清零
- *   [key,task1/2/3/4,down] 网页选择任务
- *   [key,start,down]       网页启动已选择任务
- *   [key,taskStop,down]    中止任务并回待机
- *   [slider,...]           保留网页调参
- *   [joystick,...]         已禁用：不控制小车
- *
- * task2 可调参数：
- *   [slider,task2SearchPulse,6500]  直线提前找弧线阈值，单位 pulse
- *   [slider,arcWheelDiff,2850]      兼容保留参数，主线补角已改用 yaw
- *   [slider,arcMinPulse,6500]       弧线最小平均脉冲，防止中途误判丢线
- *   [slider,arcFoundMs,80]          找到黑线确认时间，单位 ms
- *   [slider,arcLostMs,0]            离开黑线确认时间，单位 ms；0 表示满足出弯条件后丢线立即补角
- *   [slider,toArcSpeed,12]          SEARCH_ARC 直行找线速度
- *   [slider,alignTurn,12]           兼容保留参数，主线补角转速用 yawAlignTurn
- *   [slider,bcTurnSign,-1]          B->C 补角方向符号
- *   [slider,daTurnSign,1]           D->A 补角方向符号
  */
 
 #include "stm32f10x.h"
@@ -201,6 +162,7 @@ typedef enum
     TASK3_FINISH,
 
     TASK_READY_TASK4,
+    TASK4_WAIT_YAW_ZERO_NEXT_LAP,
     TASK4_FINISH
 } TaskState_t;
 
@@ -314,6 +276,7 @@ volatile uint8_t g_taskSelected = 1;
 volatile uint8_t g_taskRunning = 0;
 volatile uint8_t g_task4LapCount = 0U;
 volatile uint8_t g_task4LapTarget = 4U;
+volatile uint16_t g_task4LapYawZeroWaitMs = 200U;
 volatile float g_task1DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_task2DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_taskStopOffsetPulse = STRAIGHT_STOP_OFFSET_DEFAULT;
@@ -1595,7 +1558,8 @@ static uint8_t Task3_IsSpecialState(void)
 {
     return (uint8_t)(Task3_IsSearchState() || Task3_IsTraceState() ||
                      Task3_IsWaitAlignState() || Task3_IsAlignState() ||
-                     Task3_IsTurnBdState());
+                     Task3_IsTurnBdState() ||
+                     (g_taskState == TASK4_WAIT_YAW_ZERO_NEXT_LAP));
 }
 
 static uint8_t TaskAuto_IsSpecialState(void)
@@ -1766,14 +1730,10 @@ static void Task3_FinishAlign(void)
             if (g_task4LapCount < g_task4LapTarget)
             {
                 Control_ForcePWMZero();
-                Task3_StartLap();
-                if (!g_straightActive)
-                {
-                    g_taskRunning = 0;
-                    g_taskState = TASK_READY_TASK4;
-                    Prompt_Start(900);
-                    return;
-                }
+                g_task2AlignWaitMs = 0;
+                g_taskState = TASK4_WAIT_YAW_ZERO_NEXT_LAP;
+                g_workMode = WORK_BT;
+                g_plotMode = 4U;
                 Prompt_Start(220);
                 return;
             }
@@ -1795,6 +1755,62 @@ static void Task3_FinishAlign(void)
         Prompt_Start(1000);
         return;
     }
+}
+
+static void Task4_StartNextLapAfterYawZero(void)
+{
+    Control_ForcePWMZero();
+    MPU_ResetYaw();
+    g_taskStartYaw = 0.0f;
+    Encoder_ClearTotalsOnly();
+    App_Control_ResetPID();
+
+    g_straightYawError = 0.0f;
+    g_arcRunMs = 0;
+    g_arcStartYaw = g_yawDeg;
+    g_arcDeltaYaw = 0.0f;
+    g_arcEntryTargetValid = 0U;
+    g_task2LineValidMs = 0;
+    g_task2LineLostMs = 0;
+    g_task2AlignWaitMs = 0;
+    g_task2SearchStartPulse = 0.0f;
+    App_Line_ResetState();
+
+    Task3_StartLap();
+    if (!g_straightActive)
+    {
+        g_taskRunning = 0;
+        g_taskState = TASK_READY_TASK4;
+        Prompt_Start(900);
+        return;
+    }
+
+    Prompt_Start(220);
+}
+
+static void Task4_ControlWaitYawZeroNextLap10ms(void)
+{
+    Control_ForcePWMZero();
+    g_targetForwardSpeed = 0.0f;
+    g_targetTurnSpeed = 0.0f;
+    g_lastCmdTickMs = 0;
+
+    if (g_task4LapYawZeroWaitMs > 2000U)
+    {
+        g_task4LapYawZeroWaitMs = 2000U;
+    }
+
+    if (g_task2AlignWaitMs < 60000U - CONTROL_PERIOD_MS)
+    {
+        g_task2AlignWaitMs += CONTROL_PERIOD_MS;
+    }
+
+    if (g_task2AlignWaitMs < g_task4LapYawZeroWaitMs)
+    {
+        return;
+    }
+
+    Task4_StartNextLapAfterYawZero();
 }
 
 static void Task3_ControlSearch10ms(void)
@@ -2006,6 +2022,12 @@ static void Task3_ControlTurnBD10ms(void)
 
 static void Task3_Control10ms(void)
 {
+    if (g_taskState == TASK4_WAIT_YAW_ZERO_NEXT_LAP)
+    {
+        Task4_ControlWaitYawZeroNextLap10ms();
+        return;
+    }
+
     if (Task3_IsSearchState())
     {
         Task3_ControlSearch10ms();
@@ -2055,6 +2077,102 @@ static void Task_Reset(void)
     g_arcEntryTargetValid = 0U;
 }
 
+static void LoadPreset_SetSpeedLimitPercent(float percent)
+{
+    float ratio;
+
+    if (percent < 0.0f) percent = 0.0f;
+    if (percent > 100.0f) percent = 100.0f;
+
+    ratio = percent / 100.0f;
+    g_btSpeedLimitPercent = percent;
+    g_speedScale = ratio;
+    g_pwmLimit = (float)PWM_MAX_DUTY * ratio;
+}
+
+static void LoadPreset_Task2Stable(void)
+{
+    LoadPreset_SetSpeedLimitPercent(65.0f);
+    g_straightSpeed = 40.0f;
+    g_yawKp = 1.8f;
+    g_yawKd = 0.15f;
+
+    g_task2ArcMinForwardPulse = 5800.0f;
+    g_task2LineLostConfirmMs = 100U;
+    g_arcExitYawWindowDeg = 80.0f;
+    g_task2AlignWaitTargetMs = 300U;
+
+    g_yawAlignToleranceDeg = 3.0f;
+    g_yawAlignTurnSpeed = 8.0f;
+    g_yawAlignMaxMs = 2500U;
+
+    g_task2CAlignBiasDeg = -5.0f;
+    g_task2AAlignBiasDeg = 0.0f;
+}
+
+static void LoadPreset_Task3Stable(void)
+{
+    LoadPreset_SetSpeedLimitPercent(75.0f);
+    g_straightSpeed = 50.0f;
+    g_yawKp = 1.5f;
+    g_yawKd = 0.12f;
+
+    g_task2ArcMinForwardPulse = 5800.0f;
+    g_task2LineLostConfirmMs = 100U;
+    g_arcExitYawWindowDeg = 80.0f;
+    g_task2AlignWaitTargetMs = 300U;
+
+    g_yawAlignToleranceDeg = 4.0f;
+    g_yawAlignTurnSpeed = 8.0f;
+    g_yawAlignMaxMs = 3000U;
+
+    g_task3AcYawDeg = -39.0f;
+    g_task3CYawReset = -39.0f;
+    g_task3CAlignYaw = 5.0f;
+    g_task3CAlignBias = 15.0f;
+
+    g_task3DiagToSearchPulse = 8900.0f;
+    g_task3CbEntryYaw = 5.0f;
+    g_task3CbExitYaw = 150.0f;
+
+    g_task3BdYawDeg = 175.0f;
+    g_task3DaEntryYaw = -7.0f;
+    g_task3DaExitYaw = 13.0f;
+}
+
+static void LoadPreset_Task4Stable(void)
+{
+    LoadPreset_SetSpeedLimitPercent(75.0f);
+    g_straightSpeed = 50.0f;
+    g_yawKp = 1.5f;
+    g_yawKd = 0.12f;
+
+    g_task2ArcMinForwardPulse = 5800.0f;
+    g_task2LineLostConfirmMs = 100U;
+    g_arcExitYawWindowDeg = 80.0f;
+    g_task2AlignWaitTargetMs = 300U;
+
+    g_yawAlignToleranceDeg = 8.0f;
+    g_yawAlignTurnSpeed = 9.0f;
+    g_yawAlignMaxMs = 3000U;
+
+    g_task3AcYawDeg = -38.0f;
+    g_task3CYawReset = -38.0f;
+    g_task3CAlignYaw = 5.0f;
+    g_task3CAlignBias = 15.0f;
+
+    g_task3DiagToSearchPulse = 8900.0f;
+    g_task3CbEntryYaw = 5.0f;
+    g_task3CbExitYaw = 150.0f;
+
+    g_task3BdYawDeg = 175.0f;
+    g_task3DaEntryYaw = -14.0f;
+    g_task3DaExitYaw = 7.0f;
+
+    g_task4LapTarget = 4U;
+    g_task4LapYawZeroWaitMs = 200U;
+}
+
 static void Task_SelectTask1(void)
 {
     if (g_safetyLocked)
@@ -2081,6 +2199,8 @@ static void Task_SelectTask2(void)
         Prompt_Start(80);
         return;
     }
+
+    LoadPreset_Task2Stable();
 
     g_taskSelected = 2;
     g_taskRunning = 0;
@@ -2110,14 +2230,17 @@ static void Task_SelectOnly(uint8_t task)
     }
     else if (task == 2U)
     {
+        LoadPreset_Task2Stable();
         g_taskState = TASK_READY_TASK2;
     }
     else if (task == 3U)
     {
+        LoadPreset_Task3Stable();
         g_taskState = TASK_READY_TASK3;
     }
     else
     {
+        LoadPreset_Task4Stable();
         g_taskState = TASK_READY_TASK4;
     }
 }
@@ -2531,6 +2654,7 @@ static int ModeCode(void)
     if (g_taskState == TASK3_WAIT_ALIGN_A) return 58;
     if (g_taskState == TASK3_ALIGN_A) return 59;
     if (g_taskState == TASK3_FINISH) return 63;
+    if (g_taskState == TASK4_WAIT_YAW_ZERO_NEXT_LAP) return 65;
     if (g_taskState == TASK4_FINISH) return 64;
     if (g_taskState == TASK_FINISH) return 12;
     if (g_workMode == WORK_STANDBY)
@@ -2552,82 +2676,6 @@ static char *ModeString(void)
     return "STBY";
 }
 
-static void Serial_SendPlotStatus(void)
-{
-    int modeCode = ModeCode();
-
-    if (g_plotMode == 2U)
-    {
-        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
-                      modeCode,
-                      (int)(g_yawDeg * 10.0f),
-                      (int)(g_gyroZDps * 10.0f),
-                      (int)(g_gyroZRawDps * 10.0f),
-                      (int)(g_gyroZBiasDps * 10.0f),
-                      (int)g_mpuReady,
-                      (int)g_mpuErr,
-                      (int)g_mpuWhoAmI,
-                      (int)g_mpuCalibrated,
-                      (int)g_mpuInitTryCount);
-        return;
-    }
-
-    if (g_plotMode == 3U)
-    {
-        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%ld,%ld,%d,%d]\r\n",
-                      modeCode,
-                      (int)(g_yawDeg * 10.0f),
-                      (int)(g_straightYawError * 10.0f),
-                      (int)(g_gyroZDps * 10.0f),
-                      (int)g_targetForwardSpeed,
-                      (int)g_targetTurnSpeed,
-                      (long)g_forwardEncoderTotal,
-                      (long)g_straightDistancePulse,
-                      (int)g_leftPwm,
-                      (int)g_rightPwm);
-        return;
-    }
-
-    if (g_plotMode == 4U)
-    {
-        Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%ld,%ld,%d,%d]\r\n",
-                      modeCode,
-                      (int)(g_yawDeg * 10.0f),
-                      (int)(g_arcDeltaYaw * 10.0f),
-                      (int)(g_arcRunMs / 10U),
-                      (int)g_lineError,
-                      (int)g_lineMask,
-                      (long)g_forwardEncoderTotal,
-                      (long)Task2_GetWheelDiffPulse(),
-                      (int)g_targetTurnSpeed,
-                      (int)g_lineValid);
-        return;
-    }
-
-#if ENABLE_WEB_PID_DEBUG
-    if (g_plotMode == PLOT_MODE_WEB_PID)
-    {
-        Serial_Printf("[plot,%d,%d,%d,%d]\r\n",
-                      (int)g_targetForwardSpeed,
-                      (int)g_forwardSpeed,
-                      (int)g_forwardSpeedError,
-                      (int)g_speedPwm);
-        return;
-    }
-#endif
-
-    Serial_Printf("[p,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\r\n",
-                  modeCode,
-                  (int)g_lineError,
-                  (int)g_lineMask,
-                  (int)g_targetForwardSpeed,
-                  (int)g_forwardSpeed,
-                  (int)g_targetTurnSpeed,
-                  (int)g_turnSpeed,
-                  (int)g_leftPwm,
-                  (int)g_rightPwm,
-                  (int)g_lineValid);
-}
 
 static void OLED_Show2Digit(uint8_t x, uint8_t y, uint8_t value)
 {
@@ -2764,7 +2812,6 @@ int main(void)
         if (g_plotReportMs >= PLOT_REPORT_PERIOD_MS)
         {
             g_plotReportMs = 0;
-            Serial_SendPlotStatus();
         }
 
         if (g_oledRefreshMs >= OLED_REFRESH_PERIOD_MS)
