@@ -138,6 +138,7 @@ extern volatile float g_yawAlignMaxWheelDiff;
 
 extern volatile float g_task3AcYawDeg;
 extern volatile float g_task3BdYawDeg;
+extern volatile uint8_t g_task4LapTarget;
 
 extern volatile float g_task1MinLinePulse;
 extern volatile uint8_t g_task1UseLineStop;
@@ -565,6 +566,12 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
 
     if (App_Protocol_IsName(name, "task3AcYaw", "task3AcYawDeg", "acYaw")) { if (!App_Protocol_SetFloatRange(&g_task3AcYawDeg, value, -90.0f, 90.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task3BdYaw", "task3BdYawDeg", "bdYaw")) { if (!App_Protocol_SetFloatRange(&g_task3BdYawDeg, value, 60.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task4Laps", "task4LapTarget", "task4Lap"))
+    {
+        if (value < 1.0f || value > 10.0f) { App_Protocol_RecordError(PROTO_ERR_RANGE, "range", 1U); return PROTO_RESULT_ERROR; }
+        g_task4LapTarget = (uint8_t)(value + 0.5f);
+        return App_Protocol_ResultOk(1U);
+    }
 
     if (App_Protocol_IsName(name, "task1MinLinePulse", "task1LinePulse", "lineStopPulse")) { if (!App_Protocol_SetFloatRange(&g_task1MinLinePulse, value, 0.0f, 12000.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task1UseLineStop", "task1LineStop", "lineStopEnable"))

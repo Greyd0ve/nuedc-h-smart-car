@@ -119,21 +119,21 @@ volatile float g_lineBlackLevelF = 1.0f;
 volatile float g_lineReverseOrderF = 0.0f;
 volatile float g_lineTurnSign = 1.0f;
 
-volatile float g_traceBaseSpeed = 24.0f;
+volatile float g_traceBaseSpeed = 60.0f;
 volatile float g_traceSearchSpeed = 8.0f;
 
-volatile float g_lineKp = 0.135f;
-volatile float g_lineKd = 0.055f;
-volatile float g_lineTurnLimit = 90.0f;
-volatile float g_lineLostTurn = 72.0f;
-volatile float g_lineFilterAlpha = 0.65f;
-volatile float g_lineSlowGain = 0.55f;
-volatile float g_lineEdgeTurnExtra = 22.0f;
-volatile float g_lineEdgeSpeedRatio = 0.55f;
-volatile float g_lineMinTurn = 18.0f;
+volatile float g_lineKp = 0.350f;
+volatile float g_lineKd = 0.600f;
+volatile float g_lineTurnLimit = 180.0f;
+volatile float g_lineLostTurn = 130.0f;
+volatile float g_lineFilterAlpha = 0.58f;
+volatile float g_lineSlowGain = 0.88f;
+volatile float g_lineEdgeTurnExtra = 82.0f;
+volatile float g_lineEdgeSpeedRatio = 0.24f;
+volatile float g_lineMinTurn = 34.0f;
 
-volatile float g_forwardSlewStep = 3.0f;
-volatile float g_turnSlewStep = 14.0f;
+volatile float g_forwardSlewStep = 14.0f;
+volatile float g_turnSlewStep = 60.0f;
 
 /* ================================================================
  * 3. 速度环和转向环 PID 参数
@@ -185,7 +185,10 @@ typedef enum
     TASK3_TRACE_ARC_DA,
     TASK3_WAIT_ALIGN_A,
     TASK3_ALIGN_A,
-    TASK3_FINISH
+    TASK3_FINISH,
+
+    TASK_READY_TASK4,
+    TASK4_FINISH
 } TaskState_t;
 
 volatile WorkMode_t g_workMode = WORK_STANDBY;
@@ -198,9 +201,9 @@ volatile uint8_t g_carEnable = 0;
 volatile uint32_t g_lastCmdTickMs = 1000;
 volatile uint8_t g_safetyLocked = 0;
 
-volatile float g_btSpeedLimitPercent = 30.0f;
-volatile float g_speedScale = 0.30f;
-volatile float g_pwmLimit = 300.0f;
+volatile float g_btSpeedLimitPercent = 55.0f;
+volatile float g_speedScale = 0.55f;
+volatile float g_pwmLimit = (float)PWM_MAX_DUTY * 0.55f;
 
 volatile float g_leftSpeed = 0.0f;
 volatile float g_rightSpeed = 0.0f;
@@ -296,6 +299,8 @@ volatile float g_arcDeltaYaw = 0.0f;
 volatile TaskState_t g_taskState = TASK_IDLE;
 volatile uint8_t g_taskSelected = 1;
 volatile uint8_t g_taskRunning = 0;
+volatile uint8_t g_task4LapCount = 0U;
+volatile uint8_t g_task4LapTarget = 4U;
 volatile float g_task1DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_task2DistancePulse = STRAIGHT_DISTANCE_DEFAULT;
 volatile float g_taskStopOffsetPulse = STRAIGHT_STOP_OFFSET_DEFAULT;
@@ -1550,6 +1555,22 @@ static uint8_t TaskAuto_IsSpecialState(void)
     return (uint8_t)(Task2_IsSpecialState() || Task3_IsSpecialState());
 }
 
+static void Task3_StartLap(void)
+{
+    g_taskState = TASK3_STRAIGHT_AC;
+    g_task2LineValidMs = 0;
+    g_task2LineLostMs = 0;
+    g_task2AlignWaitMs = 0;
+    g_task2SearchStartPulse = 0.0f;
+    g_arcRunMs = 0;
+    g_arcDeltaYaw = 0.0f;
+    g_arcEntryTargetValid = 0U;
+    App_Line_ResetState();
+    App_Control_ResetPID();
+
+    Straight_StartToYaw(wrap_180(g_taskStartYaw + g_task3AcYawDeg), g_task3DiagToSearchPulse);
+}
+
 static void Task3_SearchArcStart(float turnSign)
 {
     g_straightActive = 0;
@@ -1654,7 +1675,7 @@ static void Task3_FinishTurnBD(void)
     if (!g_straightActive)
     {
         g_taskRunning = 0;
-        g_taskState = TASK_READY_TASK3;
+        g_taskState = (g_taskSelected == 4U) ? TASK_READY_TASK4 : TASK_READY_TASK3;
     }
 
     Prompt_Start(160);
@@ -1670,6 +1691,36 @@ static void Task3_FinishAlign(void)
 
     if (g_taskState == TASK3_ALIGN_A)
     {
+        if (g_taskSelected == 4U)
+        {
+            if (g_task4LapTarget < 1U) g_task4LapTarget = 4U;
+            if (g_task4LapTarget > 10U) g_task4LapTarget = 10U;
+            if (g_task4LapCount < 250U) g_task4LapCount++;
+
+            if (g_task4LapCount < g_task4LapTarget)
+            {
+                Control_ForcePWMZero();
+                Task3_StartLap();
+                if (!g_straightActive)
+                {
+                    g_taskRunning = 0;
+                    g_taskState = TASK_READY_TASK4;
+                    Prompt_Start(900);
+                    return;
+                }
+                Prompt_Start(220);
+                return;
+            }
+
+            g_taskRunning = 0;
+            g_taskState = TASK4_FINISH;
+            g_workMode = WORK_BT;
+            g_plotMode = 3U;
+            Control_ForcePWMZero();
+            Prompt_Start(1200);
+            return;
+        }
+
         g_taskRunning = 0;
         g_taskState = TASK3_FINISH;
         g_workMode = WORK_BT;
@@ -1906,6 +1957,7 @@ static void Task_Reset(void)
     g_taskState = TASK_IDLE;
     /* 不清空 g_taskSelected：本地面板 K2 选中的任务需要在待机中保持。 */
     g_taskRunning = 0;
+    g_task4LapCount = 0U;
     g_straightActive = 0;
     g_arcActive = 0;
     g_task2LineValidMs = 0;
@@ -1928,6 +1980,7 @@ static void Task_SelectTask1(void)
 
     g_taskSelected = 1;
     g_taskRunning = 0;
+    g_task4LapCount = 0U;
     g_taskState = TASK_READY_TASK1;
     g_workMode = WORK_STANDBY;
     g_localMode = LOCAL_STANDBY;
@@ -1946,6 +1999,7 @@ static void Task_SelectTask2(void)
 
     g_taskSelected = 2;
     g_taskRunning = 0;
+    g_task4LapCount = 0U;
     g_taskState = TASK_READY_TASK2;
     g_workMode = WORK_STANDBY;
     g_localMode = LOCAL_STANDBY;
@@ -1963,6 +2017,7 @@ static void Task_SelectOnly(uint8_t task)
 
     g_taskSelected = task;
     g_taskRunning = 0;
+    g_task4LapCount = 0U;
 
     if (task == 1U)
     {
@@ -1978,8 +2033,7 @@ static void Task_SelectOnly(uint8_t task)
     }
     else
     {
-        /* task4 remains selected only; K3 gives a no-motion prompt. */
-        g_taskState = TASK_IDLE;
+        g_taskState = TASK_READY_TASK4;
     }
 }
 
@@ -2025,18 +2079,23 @@ static void Task_StartSelected(void)
         return;
     }
 
-    /* task4 remains a no-motion placeholder. */
-    if (g_taskSelected == 3U)
+    if (g_taskSelected == 3U || g_taskSelected == 4U)
     {
+        if (g_taskSelected == 4U)
+        {
+            g_task4LapCount = 0U;
+            if (g_task4LapTarget < 1U) g_task4LapTarget = 4U;
+            if (g_task4LapTarget > 10U) g_task4LapTarget = 10U;
+        }
+
         g_taskStartYaw = g_yawDeg;
         g_taskRunning = 1;
-        g_taskState = TASK3_STRAIGHT_AC;
-        Straight_StartToYaw(wrap_180(g_taskStartYaw + g_task3AcYawDeg), g_task3DiagToSearchPulse);
+        Task3_StartLap();
 
         if (!g_straightActive)
         {
             g_taskRunning = 0;
-            g_taskState = TASK_READY_TASK3;
+            g_taskState = (g_taskSelected == 4U) ? TASK_READY_TASK4 : TASK_READY_TASK3;
         }
         return;
     }
@@ -2053,6 +2112,7 @@ static void Task_Stop(void)
     g_arcActive = 0;
     g_arcEntryTargetValid = 0U;
     g_taskRunning = 0;
+    g_task4LapCount = 0U;
     g_taskState = TASK_IDLE;
     g_workMode = WORK_STANDBY;
     g_localMode = LOCAL_STANDBY;
@@ -2360,6 +2420,7 @@ static int ModeCode(void)
     if (g_taskState == TASK_READY_TASK1) return 11;
     if (g_taskState == TASK_READY_TASK2) return 21;
     if (g_taskState == TASK_READY_TASK3) return 23;
+    if (g_taskState == TASK_READY_TASK4) return 24;
     if (g_taskState == TASK2_SEARCH_ARC_BC) return 31;
     if (g_taskState == TASK2_TRACE_ARC_BC) return 32;
     if (g_taskState == TASK2_WAIT_ALIGN_C) return 37;
@@ -2379,6 +2440,7 @@ static int ModeCode(void)
     if (g_taskState == TASK3_WAIT_ALIGN_A) return 58;
     if (g_taskState == TASK3_ALIGN_A) return 59;
     if (g_taskState == TASK3_FINISH) return 63;
+    if (g_taskState == TASK4_FINISH) return 64;
     if (g_taskState == TASK_FINISH) return 12;
     if (g_workMode == WORK_STANDBY)
     {
@@ -2391,19 +2453,11 @@ static int ModeCode(void)
 static char *ModeString(void)
 {
     if (g_safetyLocked) return "LOCK";
-    if (g_straightActive) return "STR";
-    if (Task2_IsSearchState()) return "SRCH";
-    if (Task2_IsTraceState()) return "ARC";
-    if (Task2_IsAlignState()) return "ALGN";
-    if (Task3_IsSearchState()) return "SRCH";
-    if (Task3_IsTraceState()) return "ARC";
-    if (Task3_IsWaitAlignState()) return "WAIT";
-    if (Task3_IsAlignState()) return "ALGN";
-    if (Task3_IsTurnBdState()) return "TURN";
-    if (g_arcActive) return "ARC";
-    if (g_workMode == WORK_TRACING) return "TRACE";
-    if (g_workMode == WORK_BT) return "BT";
     if (g_localMode == LOCAL_MPU_DEBUG) return "MPU";
+    if (g_taskState == TASK_FINISH || g_taskState == TASK2_FINISH ||
+        g_taskState == TASK3_FINISH || g_taskState == TASK4_FINISH) return "DONE";
+    if (g_taskRunning || g_straightActive || g_arcActive ||
+        TaskAuto_IsSpecialState() || g_workMode == WORK_TRACING) return "RUN";
     return "STBY";
 }
 
@@ -2486,40 +2540,10 @@ static void Serial_SendPlotStatus(void)
 
 static void OLED_ShowStatus(void)
 {
-    if (g_plotMode == 2U)
-    {
-        OLED_Printf(0, 0, OLED_8X16, "R:%d E:%02X ID:%02X", (int)g_mpuReady, (int)g_mpuErr, (int)g_mpuWhoAmI);
-        OLED_Printf(0, 16, OLED_8X16, "C:%d N:%03d", (int)g_mpuCalibrated, (int)g_mpuInitTryCount);
-        OLED_Printf(0, 32, OLED_8X16, "Y:%+04d", (int)g_yawDeg);
-        OLED_Printf(0, 48, OLED_8X16, "G:%+04d B:%+03d", (int)g_gyroZDps, (int)g_gyroZBiasDps);
-        OLED_Update();
-        return;
-    }
-
-    if (g_plotMode == 3U)
-    {
-        OLED_Printf(0, 0, OLED_8X16, "STR T:%d RP:%03d", (int)g_taskState, (int)g_btSpeedLimitPercent);
-        OLED_Printf(0, 16, OLED_8X16, "D:%+05ld/%05ld", (long)g_forwardEncoderTotal, (long)g_straightDistancePulse);
-        OLED_Printf(0, 32, OLED_8X16, "Y:%+03d E:%+03d", (int)g_yawDeg, (int)g_straightYawError);
-        OLED_Printf(0, 48, OLED_8X16, "T:%+03d P:%+04d", (int)g_targetTurnSpeed, (int)g_forwardSpeed);
-        OLED_Update();
-        return;
-    }
-
-    if (g_plotMode == 4U)
-    {
-        OLED_Printf(0, 0, OLED_8X16, "T%d S:%02d R:%04d", (int)g_taskSelected, (int)g_taskState, (int)g_arcRunMs);
-        OLED_Printf(0, 16, OLED_8X16, "E:%+04d M:%02X", (int)g_lineError, (int)g_lineMask);
-        OLED_Printf(0, 32, OLED_8X16, "F:%+05ld", (long)g_forwardEncoderTotal);
-        OLED_Printf(0, 48, OLED_8X16, "D:%+05ld V:%d", (long)Task2_GetWheelDiffPulse(), (int)g_lineValid);
-        OLED_Update();
-        return;
-    }
-
-    OLED_Printf(0, 0, OLED_8X16, "M:%s T:%d RP:%03d", ModeString(), (int)g_taskSelected, (int)g_btSpeedLimitPercent);
-    OLED_Printf(0, 16, OLED_8X16, "LK:%d S:%02d", (int)g_safetyLocked, (int)g_taskState);
-    OLED_Printf(0, 32, OLED_8X16, "L:%+04d R:%+04d", (int)g_leftPwm, (int)g_rightPwm);
-    OLED_Printf(0, 48, OLED_8X16, "R:%02X M:%02X E:%+03d", (int)g_lineRawMask, (int)g_lineMask, (int)(g_lineError / 10));
+    OLED_Printf(0, 0, OLED_8X16, "MODE:%-4s", ModeString());
+    OLED_Printf(0, 16, OLED_8X16, "TASK:%d", (int)g_taskSelected);
+    OLED_Printf(0, 32, OLED_8X16, "STATE:%02d", ModeCode());
+    OLED_Printf(0, 48, OLED_8X16, "YAW:%+04d", (int)g_yawDeg);
     OLED_Update();
 }
 
@@ -2585,11 +2609,7 @@ int main(void)
     App_Protocol_ApplySpeedLimitPercent(g_btSpeedLimitPercent);
     PromptIO_AllOff();
 
-    OLED_Printf(0, 0, OLED_8X16, "Local Standby");
-    OLED_Printf(0, 16, OLED_8X16, "K1Mode K2Task");
-    OLED_Printf(0, 32, OLED_8X16, "K3Run  K4MPU");
-    OLED_Printf(0, 48, OLED_8X16, "Task:%d", (int)g_taskSelected);
-    OLED_Update();
+    OLED_ShowStatus();
 
     while (1)
     {
