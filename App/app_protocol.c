@@ -139,6 +139,9 @@ extern volatile uint16_t g_yawAlignMaxMs;
 extern volatile float g_yawAlignMaxWheelDiff;
 
 extern volatile float g_task3AcYawDeg;
+extern volatile float g_task3CYawReset;
+extern volatile float g_task3CAlignYaw;
+extern volatile float g_task3CAlignBias;
 extern volatile float g_task3BdYawDeg;
 extern volatile uint8_t g_task4LapTarget;
 
@@ -569,6 +572,9 @@ static uint8_t App_Protocol_ApplySliderPacket(const char *name, float value)
     if (App_Protocol_IsName(name, "yawAlignMaxDiff", "yawAlignMaxWheelDiff", "alignYawMaxDiff")) { if (!App_Protocol_SetFloatRange(&g_yawAlignMaxWheelDiff, value, 500.0f, 8000.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
 
     if (App_Protocol_IsName(name, "task3AcYaw", "task3AcYawDeg", "acYaw")) { if (!App_Protocol_SetFloatRange(&g_task3AcYawDeg, value, -90.0f, 90.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3CYawReset", "cYawReset", "task3CReset")) { if (!App_Protocol_SetFloatRange(&g_task3CYawReset, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3CAlignYaw", "cAlignYaw", "task3CYaw")) { if (!App_Protocol_SetFloatRange(&g_task3CAlignYaw, value, -180.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
+    if (App_Protocol_IsName(name, "task3CAlignBias", "cAlignBias3", "task3CBias")) { if (!App_Protocol_SetFloatRange(&g_task3CAlignBias, value, -10.0f, 10.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task3BdYaw", "task3BdYawDeg", "bdYaw")) { if (!App_Protocol_SetFloatRange(&g_task3BdYawDeg, value, 60.0f, 180.0f)) return PROTO_RESULT_ERROR; return App_Protocol_ResultOk(1U); }
     if (App_Protocol_IsName(name, "task4Laps", "task4LapTarget", "task4Lap"))
     {

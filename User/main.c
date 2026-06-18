@@ -101,8 +101,8 @@
 
 #define CONTROL_PERIOD_MS              10U
 #define BT_TIMEOUT_MS                  600U
-#define PLOT_REPORT_PERIOD_MS          100U
-#define OLED_REFRESH_PERIOD_MS         100U
+#define PLOT_REPORT_PERIOD_MS          500U
+#define OLED_REFRESH_PERIOD_MS         200U
 #define MPU_UPDATE_PERIOD_MS           10U
 #define ENABLE_OLED_TEXT_DEBUG         1U
 
@@ -186,6 +186,8 @@ typedef enum
 
     TASK_READY_TASK3,
     TASK3_STRAIGHT_AC,
+    TASK3_WAIT_ALIGN_C,
+    TASK3_ALIGN_C,
     TASK3_SEARCH_ARC_CB,
     TASK3_TRACE_ARC_CB,
     TASK3_WAIT_ALIGN_B,
@@ -356,7 +358,7 @@ volatile float g_task2SearchMaxPulse = 1800.0f;
  * 如果实测补角方向反了，调 bcTurnSign/daTurnSign 即可。
  */
 volatile float g_task2BcTurnSign = -1.0f;
-volatile float g_task2DaTurnSign = 1.0f;
+volatile float g_task2DaTurnSign = -1.0f;
 
 volatile uint16_t g_task2LineValidMs = 0;
 volatile uint16_t g_task2LineLostMs = 0;
@@ -370,7 +372,7 @@ volatile float g_task2CurrentTurnSign = -1.0f;
 volatile uint16_t g_task2AlignWaitMs = 0;
 volatile uint16_t g_task2AlignWaitTargetMs = 500U;
 
-volatile float g_task3DiagToSearchPulse = 8500.0f;
+volatile float g_task3DiagToSearchPulse = 9000.0f;
 volatile float g_task3DiagTurnDiffTarget = 600.0f;
 volatile float g_task3CbTurnSign = 1.0f;
 volatile float g_task3BdTurnSign = 1.0f;
@@ -382,9 +384,9 @@ volatile float g_entryYawKd = 0.15f;
 volatile float g_entryTurnLimit = 120.0f;
 
 volatile float g_task2BcEntryYaw = -5.0f;
-volatile float g_task2DaEntryYaw = 5.0f;
-volatile float g_task3CbEntryYaw = -60.0f;
-volatile float g_task3DaEntryYaw = 60.0f;
+volatile float g_task2DaEntryYaw = -5.0f;
+volatile float g_task3CbEntryYaw = 30.0f;
+volatile float g_task3DaEntryYaw = 30.0f;
 
 volatile float g_arcEntryTargetYaw = 0.0f;
 volatile uint8_t g_arcEntryTargetValid = 0U;
@@ -404,6 +406,9 @@ volatile uint16_t g_yawAlignMaxMs = 2500U;
 volatile float g_yawAlignMaxWheelDiff = 3600.0f;
 
 volatile float g_task3AcYawDeg = -39.0f;
+volatile float g_task3CYawReset = -39.0f;
+volatile float g_task3CAlignYaw = -60.0f;
+volatile float g_task3CAlignBias = 0.0f;
 volatile float g_task3BdYawDeg = 135.0f;
 
 /* ================================================================
@@ -997,9 +1002,17 @@ static void Straight_Finish(void)
 
     if (g_taskState == TASK3_STRAIGHT_AC)
     {
-        g_taskState = TASK3_SEARCH_ARC_CB;
-        Task3_SearchArcStart(g_task3CbTurnSign);
-        Prompt_Start(120);
+        Control_ForcePWMZero();
+        MPU_ForceYaw(g_task3CYawReset);
+        g_task2AlignWaitMs = 0;
+        g_arcRunMs = 0;
+        g_arcStartYaw = g_yawDeg;
+        g_arcDeltaYaw = 0.0f;
+        g_arcEntryTargetValid = 0U;
+        g_taskState = TASK3_WAIT_ALIGN_C;
+        g_workMode = WORK_BT;
+        g_plotMode = 4U;
+        Prompt_Start(180);
         return;
     }
 
@@ -1561,12 +1574,16 @@ static uint8_t Task3_IsTraceState(void)
 
 static uint8_t Task3_IsWaitAlignState(void)
 {
-    return (g_taskState == TASK3_WAIT_ALIGN_B || g_taskState == TASK3_WAIT_ALIGN_A);
+    return (g_taskState == TASK3_WAIT_ALIGN_C ||
+            g_taskState == TASK3_WAIT_ALIGN_B ||
+            g_taskState == TASK3_WAIT_ALIGN_A);
 }
 
 static uint8_t Task3_IsAlignState(void)
 {
-    return (g_taskState == TASK3_ALIGN_B || g_taskState == TASK3_ALIGN_A);
+    return (g_taskState == TASK3_ALIGN_C ||
+            g_taskState == TASK3_ALIGN_B ||
+            g_taskState == TASK3_ALIGN_A);
 }
 
 static uint8_t Task3_IsTurnBdState(void)
@@ -1714,6 +1731,24 @@ static void Task3_FinishTurnBD(void)
 
 static void Task3_FinishAlign(void)
 {
+    if (g_taskState == TASK3_ALIGN_C)
+    {
+        Control_ForcePWMZero();
+        Encoder_ClearTotalsOnly();
+        g_task2LineValidMs = 0;
+        g_task2LineLostMs = 0;
+        g_task2AlignWaitMs = 0;
+        g_arcRunMs = 0;
+        g_arcDeltaYaw = 0.0f;
+        g_arcEntryTargetValid = 0U;
+        App_Line_ResetState();
+        App_Control_ResetPID();
+        g_taskState = TASK3_SEARCH_ARC_CB;
+        Task3_SearchArcStart(g_task3CbTurnSign);
+        Prompt_Start(120);
+        return;
+    }
+
     if (g_taskState == TASK3_ALIGN_B)
     {
         Task3_StartTurnBD();
@@ -1890,6 +1925,21 @@ static void Task3_ControlWaitAlign10ms(void)
 
     g_task2AlignWaitMs = 0;
 
+    if (g_taskState == TASK3_WAIT_ALIGN_C)
+    {
+        Encoder_ClearTotalsOnly();
+        g_arcRunMs = 0;
+        g_arcStartYaw = g_yawDeg;
+        g_arcDeltaYaw = 0.0f;
+        App_Control_ResetPID();
+        g_taskState = TASK3_ALIGN_C;
+        g_targetForwardSpeed = 0.0f;
+        g_targetTurnSpeed = 0.0f;
+        g_carEnable = 1;
+        Prompt_Start(120);
+        return;
+    }
+
     if (g_taskState == TASK3_WAIT_ALIGN_B)
     {
         Encoder_ClearTotalsOnly();
@@ -1925,7 +1975,11 @@ static void Task3_ControlAlign10ms(void)
 {
     float targetYaw;
 
-    if (g_taskState == TASK3_ALIGN_B)
+    if (g_taskState == TASK3_ALIGN_C)
+    {
+        targetYaw = wrap_180(g_task3CAlignYaw + g_task3CAlignBias);
+    }
+    else if (g_taskState == TASK3_ALIGN_B)
     {
         targetYaw = wrap_180(g_taskStartYaw + g_task3CbExitYaw);
     }
@@ -2465,6 +2519,8 @@ static int ModeCode(void)
     if (g_taskState == TASK2_WAIT_ALIGN_A) return 38;
     if (g_taskState == TASK2_ALIGN_A) return 36;
     if (g_taskState == TASK2_FINISH) return 22;
+    if (g_taskState == TASK3_WAIT_ALIGN_C) return 60;
+    if (g_taskState == TASK3_ALIGN_C) return 61;
     if (g_taskState == TASK3_SEARCH_ARC_CB) return 51;
     if (g_taskState == TASK3_TRACE_ARC_CB) return 52;
     if (g_taskState == TASK3_WAIT_ALIGN_B) return 57;
