@@ -18,7 +18,6 @@ void BT_Process(void)
  *   [slider,id,value]      或短格式 [s,id,value]
  *   [slider,RP,0~100]     使用名为 RP 的滑杆控制最高 PWM 输出百分比
  *   [key,id,down/up]       或短格式 [k,id,d/u]
- *   [key,tracing,down]     进入八路灰度循迹模式
  *   [key,Bluetooth,down]   已禁用：不进入蓝牙遥控模式
  *   [key,emergency,down]   立即急停并进入安全锁定状态
  *   [key,unlock,down]      解除安全锁，回到待机状态
@@ -58,7 +57,6 @@ extern volatile uint32_t g_protoErrBadFloatCount;
 extern volatile uint32_t g_protoErrRangeCount;
 extern volatile uint32_t g_protoErrTooLongCount;
 
-extern void App_StartTracingMode(void);
 extern void App_EmergencyStop(void);
 extern void App_UnlockControl(void);
 
@@ -107,11 +105,6 @@ static int str_equal_ignore_case(const char *a, const char *b)
         b++;
     }
     return (*a == '\0' && *b == '\0');
-}
-
-static int str_is_tracing_name(const char *s)
-{
-    return str_equal_ignore_case(s, "tracing") || str_equal_ignore_case(s, "trace") || str_equal_ignore_case(s, "line");
 }
 
 static int str_is_bluetooth_name(const char *s)
@@ -456,7 +449,6 @@ static uint8_t apply_packet(char *payload)
      * 5. 普通按键命令。
      *
      * 名称按键：
-     *   [key,tracing,down]   -> 八路灰度循迹模式
      *   [key,Bluetooth,down] -> 已禁用，不进入遥控模式
      *
      * 数字按键兼容旧代码，但运动输出已禁用。
@@ -476,12 +468,6 @@ static uint8_t apply_packet(char *payload)
             if (g_safetyLocked)
             {
                 return BT_PROTO_RESULT_IGNORED;
-            }
-
-            if (isDown && str_is_tracing_name(tok[1]))
-            {
-                App_StartTracingMode();
-                return BT_ResultOk(1U);
             }
 
             if (isDown && str_is_bluetooth_name(tok[1]))

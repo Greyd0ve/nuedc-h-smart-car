@@ -4,7 +4,6 @@
 #include <stdint.h>
 
 #define ENABLE_VERBOSE_STATUS   0U
-#define ENABLE_WEB_PID_DEBUG    0U
 #define ENABLE_LEGACY_ARCTEST   0U
 
 void App_Protocol_Process(void);
