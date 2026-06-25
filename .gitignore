@@ -1,12 +1,18 @@
 # Ignore everything by default.
 *
 
+# Keep Keil project configuration visible to Git.
+!*.uvprojx
+!Project.uvprojx
+
 # Keep source directories visible to Git.
 !Hardware/
 !User/
 !System/
 !Control/
 !App/
+!Start/
+!Library/
 
 # Track all Hardware and System sources.
 !Hardware/**
@@ -15,9 +21,14 @@
 # Track the control module introduced by staged refactors.
 !Control/**
 !App/**
+!Start/**
+!Library/**
 
 # Track the current application entry.
 !User/main.c
+!User/stm32f10x_conf.h
+!User/stm32f10x_it.c
+!User/stm32f10x_it.h
 
 # Track this ignore file.
 !.gitignore

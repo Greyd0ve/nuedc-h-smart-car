@@ -7,8 +7,8 @@
   Current real hardware target:
 
   - MCU: **STM32F103C8T6**
-  - Toolchain: **Keil MDK 5 / uVision**
-  - Compiler: **ARM Compiler 5.06**
+  - Toolchain: **Keil MDK / uVision**
+  - Compiler: **ARM Compiler 6.24 (ARMCLANG)**
   - Firmware library: **STM32F10x Standard Peripheral Library V3.5.0**
   - Architecture: **bare-metal, no RTOS**
   - Do **not** migrate to HAL, LL, STM32CubeMX, CMSIS-only, FreeRTOS, CMake, Makefile, or another MCU.
@@ -23,7 +23,7 @@
   - Preserve task1/task2/task3 behavior unless the user explicitly asks to change it.
   - Do not introduce dynamic allocation.
   - Do not add large libraries.
-  - Do not use C99/C11 features that may break ARM Compiler 5.
+  - Do not use language/library features that may break ARM Compiler 6.24 / ARMCLANG in this bare-metal SPL project.
   - Do not assume command-line builds work. The project is built through Keil.
   - Do not claim the project builds unless a Keil build log is provided.
   - If adding new source files, update both:
@@ -42,11 +42,17 @@
   Current tracked source areas:
 
   ```gitignore
+  !Project.uvprojx
+  !Start/**
+  !Library/**
   !Hardware/**
   !System/**
   !Control/**
   !App/**
   !User/main.c
+  !User/stm32f10x_conf.h
+  !User/stm32f10x_it.c
+  !User/stm32f10x_it.h
   !.gitignore
   ```
 
